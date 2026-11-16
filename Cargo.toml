@@ -1,0 +1,15 @@
+[package]
+name = "bumplist_alloc"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+description = "以固定大小 Page 链表组织的 bump 分配器"
+license = "AGPL-3.0-or-later"
+
+[features]
+default = []
+# 开启后，`BumpListAlloc` 析构时可以把未释放块的警告写到 stderr；
+# 库本身默认不依赖 std。
+std = []
+
+[dependencies]
