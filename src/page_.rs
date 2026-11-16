@@ -20,12 +20,16 @@
 //! 链，因此可以从 `PageState.first_` 走完整页的块链，统计存活/已释放块，供 debug 与
 //! `BumpListAlloc` 析构时检查未释放内存。
 
-use core::{alloc::Layout, cell::UnsafeCell, mem, ptr::NonNull};
-
-use crate::{
-    lock_::{SpinGuard, SpinLock},
-    page_size_::MAX_PAGE_CELLS,
+use core::{
+    alloc::Layout,
+    cell::UnsafeCell,
+    hint::spin_loop,
+    mem,
+    ptr::NonNull,
+    sync::atomic::{AtomicPtr, Ordering},
 };
+
+use crate::{alloc_::BumpListCore, page_size_::MAX_PAGE_CELLS};
 
 /// 指针宽度，也是 Page 内一个 cell 的字节数。
 pub(crate) const PTR: usize = mem::size_of::<usize>();
@@ -79,18 +83,27 @@ pub(crate) struct PageState {
 
 /// Page 头。
 ///
-/// 字段按大小降序手动布置：`links_`（2 个指针）、`state_`（8 字节）、`lock_`（1 字节）。
-/// 64 位下 32 字节，32 位下 20 字节，分别占 4/5 个 cell。
+/// 字段按大小降序手动布置：`links_`（2 个指针）、`state_`（8 字节）、`owner_`
+/// （指向非泛型 [`BumpListCore`] 的 owner 指针，低 1 位兼作页锁）。64 位下 32 字节，
+/// 32 位下 20 字节，分别占 4/5 个 cell。
 ///
-/// `links_` 与 `state_` 用不同的锁保护：前者由 `BumpListAlloc` 的链表锁保护，后者由
-/// 页锁保护。Page 本身不对外暴露，只通过稳定的 Page 首地址访问；页内写入从
-/// `NonNull<Page>` 的原始指针偏移，不依赖 `&Page` 的 provenance。
+/// `links_` 由 `BumpListCore` 的链表锁保护，`state_` 由页锁保护。owner 指针指向
+/// 创建本页的 `BumpListCore`；它的最低位一定是 0（Core 至少按指针宽度对齐），因此
+/// 用最低位作为页锁标记，不额外占一个锁字段。空页需要摘链 / 归还底层分配器时，
+/// `release_page_` 直接调用 `BumpListCore::cleanup_empty_page_`，不需要每个 Page 保存
+/// 函数指针。
+///
+/// Page 本身不对外暴露，只通过稳定的 Page 首地址访问；页内写入从 `NonNull<Page>` 的
+/// 原始指针偏移，不依赖 `&Page` 的 provenance。
 #[repr(C)]
 pub(crate) struct Page {
     links_: UnsafeCell<PageLinks>,
     state_: UnsafeCell<PageState>,
-    lock_: SpinLock,
+    owner_: AtomicPtr<BumpListCore>,
 }
+
+/// owner 指针的最低有效位：页锁占用标记。
+const LOCK_BIT: usize = 1;
 
 const _: () = assert!(mem::size_of::<PageState>() == 8);
 const _: () = assert!(mem::size_of::<PageLinks>() == 2 * PTR);
@@ -98,6 +111,30 @@ const _: () = assert!(mem::size_of::<PageLinks>() == 2 * PTR);
 const _: () = assert!(mem::size_of::<Page>() == 4 * PTR);
 #[cfg(target_pointer_width = "32")]
 const _: () = assert!(mem::size_of::<Page>() == 5 * PTR);
+
+/// 页锁的 RAII guard：最高位之外只用最低位，析构时清掉锁标记。
+#[derive(Debug)]
+pub(crate) struct PageGuard<'a> {
+    owner_: &'a AtomicPtr<BumpListCore>,
+}
+
+impl Drop for PageGuard<'_> {
+    fn drop(&mut self) {
+        let mut current = self.owner_.load(Ordering::Relaxed);
+        loop {
+            let cleared = current.map_addr(|addr| addr & !LOCK_BIT);
+            match self.owner_.compare_exchange_weak(
+                current,
+                cleared,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Result::Ok(_) => return,
+                Result::Err(actual) => current = actual,
+            }
+        }
+    }
+}
 
 impl Page {
     /// Page 头占用的 cell 数。
@@ -109,8 +146,17 @@ impl Page {
     ///
     /// `mem` 必须是至少 `page_size` 字节、按 `align_of::<Page>()` 对齐、尚未被写入的
     /// 独占内存块；调用方保证它来自同一个 `BumpListAlloc` 的 backing allocator。
-    pub(crate) unsafe fn init_in_place_(mem: NonNull<[u8]>) -> NonNull<Self> {
+    pub(crate) unsafe fn init_in_place_(
+        mem: NonNull<[u8]>,
+        owner: NonNull<BumpListCore>,
+    ) -> NonNull<Self> {
         let base = mem.cast::<Self>();
+        let owner_ptr = owner.as_ptr();
+        debug_assert_eq!(
+            owner_ptr.addr() & LOCK_BIT,
+            0,
+            "owner 必须按至少 2 字节对齐"
+        );
         // SAFETY: 调用方保证 mem 是足够的、对齐的独占内存；Page 头写在起始处。
         unsafe {
             base.as_ptr().write(Self {
@@ -124,20 +170,54 @@ impl Page {
                     first_: SENTINEL,
                     last_: SENTINEL,
                 }),
-                lock_: SpinLock::new(),
+                owner_: AtomicPtr::new(owner_ptr),
             });
         }
         base
     }
 
     /// 阻塞式获取页锁。
-    pub(crate) fn lock_(&self) -> SpinGuard<'_> {
-        self.lock_.lock_()
+    pub(crate) fn lock_(&self) -> PageGuard<'_> {
+        loop {
+            if let Option::Some(guard) = self.try_lock_() {
+                return guard;
+            }
+            spin_loop();
+        }
     }
 
-    /// 尝试获取页锁。
-    pub(crate) fn try_lock_(&self) -> Option<SpinGuard<'_>> {
-        self.lock_.try_lock_()
+    /// 尝试获取页锁；锁已被占用时返回 [`None`]。
+    pub(crate) fn try_lock_(&self) -> Option<PageGuard<'_>> {
+        let mut current = self.owner_.load(Ordering::Relaxed);
+        loop {
+            if current.addr() & LOCK_BIT != 0 {
+                return Option::None;
+            }
+            let tagged = current.map_addr(|addr| addr | LOCK_BIT);
+            match self.owner_.compare_exchange_weak(
+                current,
+                tagged,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Result::Ok(_) => {
+                    return Option::Some(PageGuard {
+                        owner_: &self.owner_,
+                    });
+                }
+                Result::Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// owner 指针（去掉页锁标记）。
+    fn owner_ptr_(&self) -> NonNull<BumpListCore> {
+        let raw = self
+            .owner_
+            .load(Ordering::Acquire)
+            .map_addr(|addr| addr & !LOCK_BIT);
+        // SAFETY: owner 指针在 Page 初始化时写入，永不为空。
+        unsafe { NonNull::new_unchecked(raw) }
     }
 
     /// 读取 Page 链表的 `prev_`。
@@ -273,11 +353,32 @@ impl Page {
         Some(unsafe { NonNull::new_unchecked(base_ptr.add(user_off)) })
     }
 
-    /// 获取页锁后归还一个块；返回该页是否刚刚变为空页。
-    pub(crate) fn release_(&self, page: NonNull<Page>, header_cell: u16) -> bool {
-        let _guard = self.lock_();
-        // SAFETY: 持有页锁，page 有效。
-        unsafe { self.release_locked_(page, header_cell) }
+    /// 归还一个块；返回该页是否刚刚变为空页。
+    ///
+    /// 它是关联函数而不是 `&self` 方法：页刚变空时会经 owner 回调把「空页回收」升级给
+    /// [`BumpListAlloc`]，清理可能释放 Page 本身。所有 `&Page` 借用都只活在取页锁 /
+    /// 读取 owner 的短作用域内，调用清理前已经结束，避免在已释放页上保留引用。
+    pub(crate) fn release_page_(page: NonNull<Page>, header_cell: u16) -> bool {
+        let became_empty = {
+            // SAFETY: `page` 是有效的 Page 首指针；页锁在释放块期间防止并发分配。
+            let page_ref = unsafe { page.as_ref() };
+            let guard = page_ref.lock_();
+            // SAFETY: 持有页锁，page 有效。
+            let empty = unsafe { page_ref.release_locked_(page, header_cell) };
+            drop(guard);
+            empty
+        };
+        if became_empty {
+            let owner = {
+                // SAFETY: 页刚被本线程置空，尚未升级回收；Page 仍然有效。
+                let page_ref = unsafe { page.as_ref() };
+                page_ref.owner_ptr_()
+            };
+            // SAFETY: owner 仍存活（Page 由它创建且尚未被回收）；这里已没有 `&Page`
+            // 借用，清理路径可以重新取页锁、链表锁，必要时释放 Page。
+            unsafe { owner.as_ref().cleanup_empty_page_(page) };
+        }
+        became_empty
     }
 
     /// 在已持有页锁的前提下归还一个块；返回该页是否刚刚变为空页。
@@ -396,6 +497,7 @@ mod tests_ {
     use super::*;
     use std::{
         alloc::{alloc, dealloc},
+        boxed::Box,
         vec::Vec,
     };
 
@@ -403,6 +505,8 @@ mod tests_ {
         page: NonNull<Page>,
         layout: Layout,
         page_cells: u16,
+        // owner 的堆地址在 TestPage 生命周期内保持稳定；Drop 时重建 Box 释放。
+        bump_ptr_: NonNull<crate::BumpListAlloc>,
     }
 
     impl TestPage {
@@ -413,12 +517,22 @@ mod tests_ {
             let ptr = unsafe { alloc(layout) };
             let page_ptr = NonNull::new(ptr).expect("测试页分配成功");
             let mem = NonNull::slice_from_raw_parts(page_ptr, bytes);
-            // SAFETY: 内存足够、按 Page 对齐且独占。
-            let page = unsafe { Page::init_in_place_(mem) };
+            // 用 Box::into_raw 固定 owner 地址；避免把 Box 移进结构体时对 pointee
+            // 做 Unique retag 而让 Page 里的 owner 指针失效。
+            let bump_ptr_ = NonNull::new(Box::into_raw(Box::new(
+                crate::BumpListAlloc::new(crate::PageSize::P4K).expect("4 KiB 页应当受支持"),
+            )))
+            .expect("Box::into_raw 不返回空指针");
+            // SAFETY: bump_ptr_ 指向 Box 里的稳定分配器；Core 自身在另一个 Box 中，
+            // 地址不随外层 BumpListAlloc 移动。
+            let core_ptr_ = unsafe { NonNull::from(&bump_ptr_.as_ref().core_) };
+            // SAFETY: 内存足够、按 Page 对齐且独占；owner 在 TestPage 生命周期内稳定。
+            let page = unsafe { Page::init_in_place_(mem, core_ptr_) };
             Self {
                 page,
                 layout,
                 page_cells: (bytes / PTR) as u16,
+                bump_ptr_,
             }
         }
 
@@ -432,6 +546,8 @@ mod tests_ {
         fn drop(&mut self) {
             // SAFETY: 布局与申请时一致；测试页不再被访问。
             unsafe { dealloc(self.page.as_ptr() as *mut u8, self.layout) };
+            // SAFETY: `bump_ptr_` 来自 Box::into_raw，且只在这里重建一次。
+            unsafe { drop(Box::from_raw(self.bump_ptr_.as_ptr())) };
         }
     }
 
@@ -491,19 +607,19 @@ mod tests_ {
             (3, 0)
         );
 
-        assert!(!page_ref.release_(page.page, cell_a));
+        assert!(!Page::release_page_(page.page, cell_a));
         assert_eq!(
             page_ref.scan_chain_(page.page, page_cells).expect("链有效"),
             (2, 1)
         );
 
-        assert!(!page_ref.release_(page.page, cell_b));
+        assert!(!Page::release_page_(page.page, cell_b));
         assert_eq!(
             page_ref.scan_chain_(page.page, page_cells).expect("链有效"),
             (1, 2)
         );
 
-        assert!(page_ref.release_(page.page, cell_c));
+        assert!(Page::release_page_(page.page, cell_c));
         // 最后一个块释放后 Page 回到初始 bump 状态，旧块链被清空。
         assert_eq!(
             page_ref.scan_chain_(page.page, page_cells).expect("链有效"),
@@ -551,7 +667,7 @@ mod tests_ {
         );
 
         for (index, cell) in cells.iter().enumerate() {
-            let empty = page_ref.release_(page.page, *cell);
+            let empty = Page::release_page_(page.page, *cell);
             assert_eq!(empty, index + 1 == cells.len());
         }
         assert_eq!(
@@ -585,7 +701,7 @@ mod tests_ {
         let cell_b = header_cell_(b);
         let cell_c = header_cell_(c);
 
-        assert!(!page_ref.release_(page.page, cell_b));
+        assert!(!Page::release_page_(page.page, cell_b));
         assert_eq!(
             page_ref.scan_chain_(page.page, page_cells).expect("链有效"),
             (2, 1)
@@ -600,9 +716,9 @@ mod tests_ {
             (3, 1)
         );
 
-        assert!(!page_ref.release_(page.page, cell_a));
-        assert!(!page_ref.release_(page.page, cell_c));
-        assert!(page_ref.release_(page.page, header_cell_(d)));
+        assert!(!Page::release_page_(page.page, cell_a));
+        assert!(!Page::release_page_(page.page, cell_c));
+        assert!(Page::release_page_(page.page, header_cell_(d)));
         assert_eq!(
             page_ref.scan_chain_(page.page, page_cells).expect("链有效"),
             (0, 0)
@@ -636,7 +752,7 @@ mod tests_ {
         );
 
         for (index, cell) in cells.iter().enumerate() {
-            let empty = page_ref.release_(page.page, *cell);
+            let empty = Page::release_page_(page.page, *cell);
             assert_eq!(empty, index + 1 == cells.len());
         }
         assert_eq!(

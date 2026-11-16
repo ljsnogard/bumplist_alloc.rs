@@ -61,26 +61,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ```text
 BumpListAlloc<A>
-├── alloc_: A
-├── page_size_: PageSize
-├── list_lock_                  // 只保护 Page 链表
-└── inner_
-    ├── head_ ──> Page A <──> Page B <──> Page C
-    ├── tail_                         // 分配时优先尝试的页
-    └── tail_empty_: bool             // tail_ 是否为空页
+├── core_: BumpListCore          // 非泛型，直接内联
+│   ├── page_size_ / page_cells_ / page_bytes_
+│   ├── list_lock_               // 只保护 Page 链表
+│   ├── backing_alloc_ / backing_dealloc_  // 两个单态化函数指针
+│   ├── self_ptr_                // 整分配器地址；offset_of! 用它取 alloc_
+│   └── inner_
+│       ├── head_ ──> Page A <──> Page B <──> Page C
+│       ├── tail_                     // 分配时优先尝试的页
+│       └── tail_empty_: bool         // tail_ 是否为空页
+└── alloc_: A                    // 底层分配器；Core 用 offset_of! 反推它
 ```
+
+> **地址稳定性**：`core_` 直接内联在 `BumpListAlloc` 里，Page 的 owner 指向它。
+> 创建第一个 Page 之后，`BumpListAlloc` 不能再移动；需要移动时先 `Box::new(bump)` 固定
+> 地址，再进行第一次分配。
 
 每个 Page 有：
 
-- 页首的 Page 头：链表指针、页锁、`used_` / `live_` / `first_` / `last_`；
-  `Page` / `PageLinks` / `PageState` / `BlockHeader` / `SpinLock` 都是 `#[repr(C)]`，
-  字段按大小手动编排；Page 头在 64 位下 32 字节、32 位下 20 字节；
+- 页首的 Page 头：链表指针、`used_` / `live_` / `first_` / `last_` 与 owner 指针
+  （最低位兼作页锁）；`Page` / `PageLinks` / `PageState` / `BlockHeader` / `SpinLock`
+  都是 `#[repr(C)]`，字段按大小手动编排；Page 头在 64 位下 32 字节、32 位下 20 字节；
 - 一个内嵌的块链：每个 `BlockHeader` 保存自身 cell 下标（低 15 位）、已释放标记
   （最高位）与下一个块头的 cell 下标；
-- 页锁：保护本页的 bump 游标、活跃块计数与块链状态。
+- 页锁：owner 指针的最低位，保护本页的 bump 游标、活跃块计数与块链状态；owner 指向
+  非泛型的 `BumpListCore`，它至少按指针宽度对齐，最低位必然为 0，因此不需要额外的锁字段。
 
 普通 `deallocate` 只需要页锁。`live_` 归零时，先把 `used_` / `first_` / `last_`
-重置；清理路径再取页锁、`list_lock_`，把这个空页挪到 `tail_` 保留复用。如果已经有
+重置，再通过 Page 的 owner 指针把清理升级给 `BumpListCore`：清理路径取页锁、
+`list_lock_`，把这个空页挪到 `tail_` 保留复用。如果已经有
 一个空 tail，则把多出来的空页摘链归还。因此 allocator 始终最多缓存一个空 Page，
 且它总是 `tail_`；不需要 `retiring` 标记，也不需要 drain。
 
@@ -101,6 +110,9 @@ cargo test --features std
 ## 特性
 
 - 标准 `core::alloc::Allocator`，但只实现给 `&BumpListAlloc`；
+- `denco_arena`：额外实现 `abs_denco::de::TrArena` / `TrArenaBytes`，让
+  `MpDecoder::new_in` 可以把字符串 / 字节切片分配进同一个分配器；`TrArena::Ref<T>` 是
+  `BumpListBox`，析构时运行 `T` 的析构函数并调用 `Page::release_` 把块归还到页内；
 - 不实现 `Clone`；需要共享时使用 `&` 或 `Arc`；
 - 默认 `A = Global`；`A: Send + Sync` 时 `BumpListAlloc` 是 `Send + Sync`；
 - 所有 Page 同大小；最多缓存一个空 tail Page，其余空页归还；

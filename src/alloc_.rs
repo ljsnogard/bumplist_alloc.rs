@@ -2,12 +2,13 @@
 
 use alloc::alloc::Global;
 use core::{
-    alloc::{AllocError, Allocator, Layout},
+    alloc::{AllocError, Allocator, AllocatorClone, Layout},
     cell::UnsafeCell,
     hint::spin_loop,
     mem,
     num::NonZero,
     ptr::NonNull,
+    sync::atomic::{AtomicPtr, Ordering},
 };
 
 use crate::{
@@ -35,106 +36,71 @@ impl Inner {
     }
 }
 
-/// 以固定大小 Page 链表组织的 bump 分配器。
+/// 页申请函数指针；参数是整个 `BumpListAlloc<A>` 的地址。
+type PageAllocFn = unsafe fn(*const (), Layout) -> Result<NonNull<[u8]>, AllocError>;
+
+/// 页归还函数指针；参数是整个 `BumpListAlloc<A>` 的地址。
+type PageDeallocFn = unsafe fn(*const (), NonNull<u8>, Layout);
+
+/// 从整个 `BumpListAlloc<A>` 的地址取出 `alloc_: A`。
 ///
-/// # 生命周期
+/// # Safety
 ///
-/// 只为 `&BumpListAlloc` 实现 [`Allocator`]，因此交给容器的分配器类型携带借期：
+/// `base` 必须指向一个真实的 `BumpListAlloc<A>`，且其地址在调用期间有效。
+unsafe fn allocator_ptr_<A: Allocator>(base: *const ()) -> *const A {
+    // SAFETY: 字段偏移由编译器给出；base 带整个结构体的 provenance。
+    unsafe {
+        base.cast::<u8>()
+            .add(core::mem::offset_of!(BumpListAlloc<A>, alloc_))
+            .cast::<A>()
+    }
+}
+
+/// # Safety
 ///
-/// ```
-/// use bumplist_alloc::{BumpListAlloc, PageSize};
-/// use std::vec::Vec;
+/// `base` 必须指向一个真实且仍然存活的 `BumpListAlloc<A>`。
+unsafe fn alloc_page_<A: Allocator>(
+    base: *const (),
+    layout: Layout,
+) -> Result<NonNull<[u8]>, AllocError> {
+    // SAFETY: 由调用方保证 base 指向 BumpListAlloc<A>。
+    let alloc = unsafe { &*allocator_ptr_::<A>(base) };
+    <A as Allocator>::allocate(alloc, layout)
+}
+
+/// # Safety
 ///
-/// let bump = BumpListAlloc::new(PageSize::P4K)?;
-/// let mut values: Vec<u32, &BumpListAlloc> = Vec::new_in(&bump);
-/// values.extend_from_slice(&[1, 2, 3]);
-/// assert_eq!(&values[..], &[1, 2, 3]);
-/// # Ok::<(), Box<dyn std::error::Error>>(())
-/// ```
+/// `base` 必须指向一个真实且仍然存活的 `BumpListAlloc<A>`，且 `page`/`layout` 来自该分配器。
+unsafe fn dealloc_page_<A: Allocator>(base: *const (), page: NonNull<u8>, layout: Layout) {
+    // SAFETY: 由调用方保证 base 指向 BumpListAlloc<A>。
+    let alloc = unsafe { &*allocator_ptr_::<A>(base) };
+    // SAFETY: 由调用方保证 page/layout 契约。
+    unsafe { <A as Allocator>::deallocate(alloc, page, layout) };
+}
+
+/// 与 `A` 无关的分配器核心：页大小、链表锁、页链表与页 backing。
 ///
-/// `BumpListAlloc` 本身不实现 `Clone`；需要共享时使用 `&` 或 `Arc`。
+/// 它直接内联在 `BumpListAlloc<A>` 里；Page 的 owner 指向它。真正需要 `A` 的建页 /
+/// 还页使用 Core 里的两个单态化函数指针；Core 保存一个指向整个 `BumpListAlloc<A>` 的
+/// 原子指针，函数用 `offset_of!` 从它取出 `alloc_`。因此不需要 Box<A>，也不需要每个
+/// Page 保存函数指针。该指针在每次分配 / 归还 / 析构前刷新，所以移动 `BumpListAlloc`
+/// 后下一次操作会重新指向新地址。
 ///
-/// # 固定页大小
-///
-/// 同一个实例的所有 Page 都使用创建时选定的 [`PageSize`]。单个分配必须完整落在一个
-/// Page 内；超过页可容纳空间时 [`Allocator::allocate`] 返回 [`AllocError`]。这适合小
-/// 对象池，不是通用的大块分配器。
-///
-/// # 回收
-///
-/// 页内释放的块不会被重新分配；整页的 `live_` 归零后，页会从链表摘下并归还给底层
-/// 分配器。每个块的 `BlockHeader` 形成页内块链，可从 `PageState.first_` 扫描整页的
-/// 存活/已释放块，用于 debug 与析构时的未释放内存检查。
-///
-/// # 线程安全
-///
-/// 当 `A: Send + Sync`（默认 `A = Global`）时，`BumpListAlloc` 是 `Send + Sync`。链表
-/// 由一把锁保护，每个 Page 有独立的页锁；普通的 `deallocate` 只取页锁，只有页变空
-/// 需要摘链时才取链表锁。
-///
-/// # Examples
-///
-/// ```
-/// use bumplist_alloc::{BumpListAlloc, PageSize};
-/// use std::vec::Vec;
-///
-/// let bump = BumpListAlloc::new(PageSize::P8K)?;
-/// let mut values: Vec<u64, &BumpListAlloc> = Vec::new_in(&bump);
-/// for value in 0..16 {
-///     values.push(value);
-/// }
-/// assert_eq!(values.iter().sum::<u64>(), 120);
-/// # Ok::<(), Box<dyn std::error::Error>>(())
-/// ```
-///
-/// `BumpListAlloc` 不实现 `Clone`：
-///
-/// ```compile_fail
-/// use bumplist_alloc::{BumpListAlloc, PageSize};
-///
-/// let bump = BumpListAlloc::new(PageSize::P4K).unwrap();
-/// let _copy = bump.clone();
-/// ```
-pub struct BumpListAlloc<A: Allocator = Global> {
-    alloc_: A,
+/// 但 Page 的 owner 指向内联 Core，因此创建第一个 Page 之后仍不能移动 `BumpListAlloc`。
+pub(crate) struct BumpListCore {
     page_size_: PageSize,
     page_cells_: u16,
     page_bytes_: usize,
     list_lock_: SpinLock,
     inner_: UnsafeCell<Inner>,
+    backing_alloc_: PageAllocFn,
+    backing_dealloc_: PageDeallocFn,
+    self_ptr_: AtomicPtr<()>,
 }
 
-// SAFETY: `Inner` 与 Page 链表中的 `NonNull` 指针由 `list_lock_` 保护；Page 的
-// `state_` 由页锁保护；Page 地址在分配后不再移动。`A` 的 `Send` 允许整个 allocator
-// 转移线程。
-unsafe impl<A: Allocator + Send> Send for BumpListAlloc<A> {}
-
-// SAFETY: 共享 `&BumpListAlloc` 时，链表由链表锁保护，页状态由页锁保护；
-// `A: Sync` 保证底层分配器可被并发借用。Page 的 `links_` / `state_` 使用
-// `UnsafeCell`，分别由两把锁保护不相交字段。
-unsafe impl<A: Allocator + Sync> Sync for BumpListAlloc<A> {}
-
-impl<A: Allocator> BumpListAlloc<A> {
-    /// 使用指定的底层分配器与页大小创建一个空 allocator。
-    ///
-    /// 构造时不申请 Page，第一次分配才会申请。
-    ///
-    /// # Errors
-    ///
-    /// 页大小在当前平台不受支持，或页内连 Page 头、一个块头与一个数据 cell 都放不下
-    /// 时返回 [`BumpListAllocError::UnsupportedPageSize`]。
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use bumplist_alloc::{BumpListAlloc, PageSize};
-    /// use std::alloc::Global;
-    ///
-    /// let bump = BumpListAlloc::new_in(Global, PageSize::P2K)?;
-    /// assert_eq!(bump.page_size(), PageSize::P2K);
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
-    pub fn new_in(alloc: A, page_size: PageSize) -> Result<Self, BumpListAllocError> {
+impl BumpListCore {
+    /// 用底层分配器类型与页大小构造核心；数据指针在第一次操作前刷新。
+    fn new_<A: Allocator>(page_size: PageSize) -> Result<Self, BumpListAllocError> {
         if !page_size.is_supported() {
             return Err(BumpListAllocError::UnsupportedPageSize { page_size });
         }
@@ -143,28 +109,32 @@ impl<A: Allocator> BumpListAlloc<A> {
             return Err(BumpListAllocError::UnsupportedPageSize { page_size });
         }
         Ok(Self {
-            alloc_: alloc,
             page_size_: page_size,
             page_cells_: cells as u16,
             page_bytes_: page_size.bytes(),
             list_lock_: SpinLock::new(),
             inner_: UnsafeCell::new(Inner::empty_()),
+            backing_alloc_: alloc_page_::<A>,
+            backing_dealloc_: dealloc_page_::<A>,
+            self_ptr_: AtomicPtr::new(core::ptr::null_mut()),
         })
     }
 
     /// 当前实例的页大小。
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use bumplist_alloc::{BumpListAlloc, PageSize};
-    ///
-    /// let bump = BumpListAlloc::new(PageSize::P1K)?;
-    /// assert_eq!(bump.page_size(), PageSize::P1K);
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
-    pub fn page_size(&self) -> PageSize {
+    pub(crate) fn page_size_(&self) -> PageSize {
         self.page_size_
+    }
+
+    /// 把整分配器地址写入 Core；`offset_of!` 之后从这里取 `alloc_`。
+    pub(crate) fn set_self_ptr_<A: Allocator>(&self, this: &BumpListAlloc<A>) {
+        self.self_ptr_.store(
+            this as *const BumpListAlloc<A> as *mut (),
+            Ordering::Release,
+        );
+    }
+
+    fn self_ptr_(&self) -> *const () {
+        self.self_ptr_.load(Ordering::Acquire).cast()
     }
 
     fn lock_list_(&self) -> SpinGuard<'_> {
@@ -175,10 +145,12 @@ impl<A: Allocator> BumpListAlloc<A> {
     fn create_page_(&self) -> Result<NonNull<Page>, AllocError> {
         let layout = Layout::from_size_align(self.page_bytes_, mem::align_of::<Page>())
             .map_err(|_| AllocError)?;
-        let mem = self.alloc_.allocate(layout)?;
+        let base = self.self_ptr_();
+        // SAFETY: base 在最近一次操作前刷新为整个 BumpListAlloc<A>；A 仍然存活。
+        let mem = unsafe { (self.backing_alloc_)(base, layout) }?;
         // SAFETY: mem 是刚申请、至少 page_bytes 字节、按 Page 对齐的独占内存；
         // Page 头占用不超过 page_bytes。
-        Ok(unsafe { Page::init_in_place_(mem) })
+        Ok(unsafe { Page::init_in_place_(mem, NonNull::from(self)) })
     }
 
     /// 归还一个已摘链、已 drain 的 Page。
@@ -186,8 +158,9 @@ impl<A: Allocator> BumpListAlloc<A> {
         // SAFETY: page 由 create_page_ 以同一布局申请，且调用方保证已摘链、无页锁持有者。
         let layout =
             unsafe { Layout::from_size_align_unchecked(self.page_bytes_, mem::align_of::<Page>()) };
-        // SAFETY: 同上；底层分配器与申请时是同一个。
-        unsafe { self.alloc_.deallocate(page.cast::<u8>(), layout) };
+        let base = self.self_ptr_();
+        // SAFETY: 同上；page/layout 来自本分配器，A 先于 Core 存续。
+        unsafe { (self.backing_dealloc_)(base, page.cast::<u8>(), layout) };
     }
 
     /// 把新页追加到 `tail` 之后，并更新 `head_` / `tail_`。
@@ -371,19 +344,15 @@ impl<A: Allocator> BumpListAlloc<A> {
         let page_addr = unsafe { header_addr.sub(offset) };
         // SAFETY: Page 首地址非空且落在同一页分配内。
         let page = unsafe { NonNull::new_unchecked(page_addr as *mut Page) };
-        // SAFETY: 块活跃，Page 在块释放前有效。
-        let page_ref = unsafe { page.as_ref() };
-
-        if page_ref.release_(page, header_cell) {
-            self.cleanup_empty_page_(page);
-        }
+        // `release_page_` 在页变空时会通过 Page 的 owner 指针把回收升级给本分配器。
+        let _ = Page::release_page_(page, header_cell);
     }
 
     /// 回收一个刚变空的 Page。
     ///
     /// 规则：只保留 `tail_` 这一个空页供复用；其它空页摘链并归还。函数持有页锁
     /// 再去取链表锁，配合分配路径的 `try_lock` 回退，不会形成 ABBA 死锁。
-    fn cleanup_empty_page_(&self, page: NonNull<Page>) {
+    pub(crate) fn cleanup_empty_page_(&self, page: NonNull<Page>) {
         // SAFETY: 调用方保证 page 仍然有效（活跃块刚刚归还或旧 tail）。
         let page_ref = unsafe { page.as_ref() };
         let page_guard = page_ref.lock_();
@@ -448,6 +417,102 @@ impl<A: Allocator> BumpListAlloc<A> {
     }
 }
 
+/// 以固定大小 Page 链表组织的 bump 分配器。
+///
+/// # 生命周期
+///
+/// 只为 `&BumpListAlloc` 实现 [`Allocator`]，因此交给容器的分配器类型携带借期：
+///
+/// ```
+/// use bumplist_alloc::{BumpListAlloc, PageSize};
+/// use std::vec::Vec;
+///
+/// let bump = BumpListAlloc::new(PageSize::P4K)?;
+/// let mut values: Vec<u32, &BumpListAlloc> = Vec::new_in(&bump);
+/// values.extend_from_slice(&[1, 2, 3]);
+/// assert_eq!(&values[..], &[1, 2, 3]);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+///
+/// `BumpListAlloc` 本身不实现 `Clone`；需要共享时使用 `&` 或 `Arc`。
+///
+/// # 地址稳定性
+///
+/// `BumpListCore` 直接内联在 `BumpListAlloc` 里；Page 的 owner 指向它。Core 保存一个
+/// 指向整个分配器的原子指针，单态化函数用 `offset_of!` 从它取出 `alloc_`，因此不需要
+/// `Box<A>`；该指针在每次分配 / 归还 / 析构前刷新。
+///
+/// **地址稳定性**：Page 的 owner 指向内联 Core，因此创建第一个 Page 之后
+/// `BumpListAlloc` 不能被移动；需要移动请先 `Box::new` / `pin` 固定地址再分配。
+pub struct BumpListAlloc<A: Allocator = Global> {
+    /// 非泛型核心；Page 的 owner 指向它。声明在 `alloc_` 之前，因此先于 A 析构。
+    pub(crate) core_: BumpListCore,
+
+    /// 底层分配器；Core 的单态化函数从 Core 地址反推它。
+    alloc_: A,
+}
+
+// SAFETY: `Inner` 与 Page 链表中的 `NonNull` 指针由 `list_lock_` 保护；Page 的
+// `state_` 由页锁保护；Page 地址在分配后不再移动。`A` 的 `Send` 允许整个 allocator
+// 转移线程。
+unsafe impl<A: Allocator + Send> Send for BumpListAlloc<A> {}
+
+// SAFETY: 共享 `&BumpListAlloc` 时，链表由链表锁保护，页状态由页锁保护；
+// `A: Sync` 保证底层分配器可被并发借用。Page 的 `links_` / `state_` 使用
+// `UnsafeCell`，分别由两把锁保护不相交字段。
+unsafe impl<A: Allocator + Sync> Sync for BumpListAlloc<A> {}
+
+impl<A: Allocator> Drop for BumpListAlloc<A> {
+    fn drop(&mut self) {
+        // 刷新自指针到当前地址；随后 `core_` 字段先析构并使用它归还所有页。
+        self.core_.set_self_ptr_(self);
+    }
+}
+
+impl<A: Allocator> BumpListAlloc<A> {
+    /// 使用指定的底层分配器与页大小创建一个空 allocator。
+    ///
+    /// 构造时不申请 Page，第一次分配才会申请。
+    ///
+    /// # Errors
+    ///
+    /// 页大小在当前平台不受支持，或页内连 Page 头、一个块头与一个数据 cell 都放不下
+    /// 时返回 [`BumpListAllocError::UnsupportedPageSize`]。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bumplist_alloc::{BumpListAlloc, PageSize};
+    /// use std::alloc::Global;
+    ///
+    /// let bump = BumpListAlloc::new_in(Global, PageSize::P2K)?;
+    /// assert_eq!(bump.page_size(), PageSize::P2K);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn new_in(alloc: A, page_size: PageSize) -> Result<Self, BumpListAllocError> {
+        let core_ = BumpListCore::new_::<A>(page_size)?;
+        Ok(Self {
+            core_,
+            alloc_: alloc,
+        })
+    }
+
+    /// 当前实例的页大小。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bumplist_alloc::{BumpListAlloc, PageSize};
+    ///
+    /// let bump = BumpListAlloc::new(PageSize::P1K)?;
+    /// assert_eq!(bump.page_size(), PageSize::P1K);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn page_size(&self) -> PageSize {
+        self.core_.page_size_()
+    }
+}
+
 impl BumpListAlloc<Global> {
     /// 使用 `Global` 作为底层分配器创建 allocator。
     ///
@@ -469,7 +534,7 @@ impl BumpListAlloc<Global> {
     }
 }
 
-impl<A: Allocator> Drop for BumpListAlloc<A> {
+impl Drop for BumpListCore {
     fn drop(&mut self) {
         let head = {
             let inner = self.inner_.get_mut();
@@ -507,14 +572,19 @@ impl<A: Allocator> Drop for BumpListAlloc<A> {
 
 unsafe impl<A: Allocator> Allocator for &BumpListAlloc<A> {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-        self.allocate_(layout)
+        self.core_.set_self_ptr_(self);
+        self.core_.allocate_(layout)
     }
 
     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        self.core_.set_self_ptr_(self);
         // SAFETY: 由 Allocator::deallocate 的调用方保证契约。
-        unsafe { self.deallocate_(ptr, layout) };
+        unsafe { self.core_.deallocate_(ptr, layout) };
     }
 }
+
+unsafe impl<A: Allocator> AllocatorClone for &BumpListAlloc<A>
+{}
 
 #[cfg(test)]
 mod tests_ {
@@ -522,9 +592,57 @@ mod tests_ {
     use crate::page_::Page;
     use std::vec::Vec;
 
+    /// 测试 `TrArena` 的 `BumpListBox` 析构后把块归还给页。
+    /// Test that dropping a `TrArena` `BumpListBox` releases its block back to the page.
+    ///
+    /// - 手段：用 `TrArena::alloc_value_async` 分配一个 `u64`，检查 live 为 1；drop 句柄后再检查。
+    /// - 判定：drop 后 live 回到 0，且唯一空页仍被保留为 tail（页数为 1）。
+    ///
+    /// - Means: allocate a `u64` through `TrArena::alloc_value_async`, observe live == 1,
+    ///   then drop the handle.
+    /// - Verdict: live returns to 0 and the single empty page is kept as the tail (page
+    ///   count stays 1).
+    #[cfg(feature = "denco_arena")]
+    #[test]
+    fn denco_arena_box_release_returns_block_() {
+        use core::{
+            future::Future,
+            pin::pin,
+            task::{Context, Poll, Waker},
+        };
+
+        use abs_denco::de::TrArena;
+
+        fn block_on_<TyFut>(future: TyFut) -> TyFut::Output
+        where
+            TyFut: Future,
+        {
+            let mut cx = Context::from_waker(Waker::noop());
+            let mut future = pin!(future);
+            loop {
+                match future.as_mut().poll(&mut cx) {
+                    Poll::Ready(output) => return output,
+                    Poll::Pending => core::hint::spin_loop(),
+                }
+            }
+        }
+
+        let bump = BumpListAlloc::new(crate::PageSize::P4K).expect("4 KiB 页应当受支持");
+        let value = block_on_(bump.alloc_value_async(7u64)).expect("arena 分配应当成功");
+        assert_eq!(count_live_(&bump), 1u16);
+        drop(value);
+        assert_eq!(count_live_(&bump), 0u16);
+        assert_eq!(count_pages_(&bump), 1usize);
+    }
+
+    /// 测试直接调用 Core 时先刷新整分配器自指针。
+    fn set_self_(bump: &BumpListAlloc<Global>) {
+        bump.core_.set_self_ptr_(bump);
+    }
+
     fn count_pages_(bump: &BumpListAlloc<Global>) -> usize {
         // SAFETY: 单线程测试，没有并发访问。
-        let inner = unsafe { &*bump.inner_.get() };
+        let inner = unsafe { &*bump.core_.inner_.get() };
         let mut cursor = inner.head_;
         let mut count = 0;
         while let Some(page) = cursor {
@@ -537,14 +655,14 @@ mod tests_ {
 
     fn count_live_(bump: &BumpListAlloc<Global>) -> u16 {
         // SAFETY: 单线程测试，没有并发访问。
-        let inner = unsafe { &*bump.inner_.get() };
+        let inner = unsafe { &*bump.core_.inner_.get() };
         let mut cursor = inner.head_;
         let mut total = 0u16;
         while let Some(page) = cursor {
             // SAFETY: 单线程测试，Page 有效。
             let page_ref = unsafe { page.as_ref() };
             let (live, _freed) = page_ref
-                .scan_chain_(page, bump.page_cells_)
+                .scan_chain_(page, bump.core_.page_cells_)
                 .expect("链应当有效");
             total = total.checked_add(live).expect("live 计数不溢出");
             // SAFETY: 单线程测试，链表有效。
@@ -580,28 +698,38 @@ mod tests_ {
         assert_eq!(count_pages_(&bump), 0);
 
         let layout = Layout::from_size_align(8, 8).expect("布局合法");
-        let block = bump.allocate_(layout).expect("分配成功");
+        let block = {
+            set_self_(&bump);
+            bump.core_.allocate_(layout)
+        }
+        .expect("分配成功");
         let ptr = block_ptr_(block);
         assert_eq!(count_pages_(&bump), 1);
         assert_eq!(count_live_(&bump), 1);
 
         // SAFETY: 单线程测试，链头有效。
-        let head = unsafe { (*bump.inner_.get()).head_ }.expect("有页");
+        let head = unsafe { (*bump.core_.inner_.get()).head_ }.expect("有页");
         assert_eq!(page_of_block_(ptr), head);
 
         // SAFETY: 指针来自同一 allocator 与 layout。
-        unsafe { bump.deallocate_(ptr, layout) };
+        set_self_(&bump);
+        unsafe { bump.core_.deallocate_(ptr, layout) };
         // 唯一空 Page 被保留为 tail，不归还；它应该可以直接复用。
         assert_eq!(count_pages_(&bump), 1);
         assert_eq!(count_live_(&bump), 0);
 
-        let block_again = bump.allocate_(layout).expect("空页应当可复用");
+        let block_again = {
+            set_self_(&bump);
+            bump.core_.allocate_(layout)
+        }
+        .expect("空页应当可复用");
         assert_eq!(count_pages_(&bump), 1);
         assert_eq!(count_live_(&bump), 1);
         assert_eq!(page_of_block_(block_ptr_(block_again)), head);
 
         // SAFETY: 指针来自同一 allocator 与 layout。
-        unsafe { bump.deallocate_(block_ptr_(block_again), layout) };
+        set_self_(&bump);
+        unsafe { bump.core_.deallocate_(block_ptr_(block_again), layout) };
         assert_eq!(count_pages_(&bump), 1);
         assert_eq!(count_live_(&bump), 0);
     }
@@ -619,7 +747,11 @@ mod tests_ {
         let mut blocks = Vec::new();
 
         for _ in 0..12 {
-            let block = bump.allocate_(layout).expect("块应当放得下");
+            let block = {
+                set_self_(&bump);
+                bump.core_.allocate_(layout)
+            }
+            .expect("块应当放得下");
             blocks.push(block_ptr_(block));
         }
         assert!(count_pages_(&bump) >= 2);
@@ -627,13 +759,15 @@ mod tests_ {
 
         for index in (0..12).step_by(2) {
             // SAFETY: 指针来自同一 allocator 与 layout。
-            unsafe { bump.deallocate_(blocks[index], layout) };
+            set_self_(&bump);
+            unsafe { bump.core_.deallocate_(blocks[index], layout) };
         }
         assert_eq!(count_live_(&bump), 6);
 
         for index in (1..12).step_by(2) {
             // SAFETY: 指针来自同一 allocator 与 layout。
-            unsafe { bump.deallocate_(blocks[index], layout) };
+            set_self_(&bump);
+            unsafe { bump.core_.deallocate_(blocks[index], layout) };
         }
         assert_eq!(count_live_(&bump), 0);
         // 多页都空掉后只保留 tail 这一个空页，其余归还。
@@ -650,23 +784,32 @@ mod tests_ {
     fn empty_tail_alignment_failure_does_not_append() {
         let bump = BumpListAlloc::new(PageSize::P1K).expect("1 KiB 页");
         let layout = Layout::from_size_align(8, 8).expect("布局合法");
-        let block = bump.allocate_(layout).expect("分配成功");
+        let block = {
+            set_self_(&bump);
+            bump.core_.allocate_(layout)
+        }
+        .expect("分配成功");
         let ptr = block_ptr_(block);
         // SAFETY: 指针来自同一 allocator 与 layout。
-        unsafe { bump.deallocate_(ptr, layout) };
+        set_self_(&bump);
+        unsafe { bump.core_.deallocate_(ptr, layout) };
         assert_eq!(count_pages_(&bump), 1);
         assert_eq!(count_live_(&bump), 0);
 
         let over_aligned = Layout::from_size_align(8, 1 << 20).expect("布局合法");
-        assert!(bump.allocate_(over_aligned).is_err());
+        assert!(bump.core_.allocate_(over_aligned).is_err());
         assert_eq!(count_pages_(&bump), 1);
         assert_eq!(count_live_(&bump), 0);
 
         // 空页仍然可用。
-        let again = bump.allocate_(layout).expect("空页应当仍可复用");
+        let again = {
+            set_self_(&bump);
+            bump.core_.allocate_(layout)
+        }
+        .expect("空页应当仍可复用");
         assert_eq!(count_live_(&bump), 1);
         // SAFETY: 指针来自同一 allocator 与 layout。
-        unsafe { bump.deallocate_(block_ptr_(again), layout) };
+        unsafe { bump.core_.deallocate_(block_ptr_(again), layout) };
         assert_eq!(count_pages_(&bump), 1);
     }
 
@@ -679,7 +822,13 @@ mod tests_ {
     fn oversized_request_is_rejected_without_page() {
         let bump = BumpListAlloc::new(PageSize::P1K).expect("1 KiB 页");
         let layout = Layout::from_size_align(8 * 1024, 8).expect("布局合法");
-        assert!(bump.allocate_(layout).is_err());
+        assert!(
+            {
+                set_self_(&bump);
+                bump.core_.allocate_(layout)
+            }
+            .is_err()
+        );
         assert_eq!(count_pages_(&bump), 0);
         assert_eq!(count_live_(&bump), 0);
     }
@@ -693,13 +842,18 @@ mod tests_ {
     fn zero_sized_allocation_has_no_page() {
         let bump = BumpListAlloc::new(PageSize::P1K).expect("1 KiB 页");
         let layout = Layout::new::<()>();
-        let block = bump.allocate_(layout).expect("零尺寸分配成功");
+        let block = {
+            set_self_(&bump);
+            bump.core_.allocate_(layout)
+        }
+        .expect("零尺寸分配成功");
         let ptr = block_ptr_(block);
         assert_eq!(count_pages_(&bump), 0);
         assert_eq!(ptr.as_ptr() as usize % layout.align(), 0);
 
         // SAFETY: 同一 allocator 与 layout 的零尺寸分配。
-        unsafe { bump.deallocate_(ptr, layout) };
+        set_self_(&bump);
+        unsafe { bump.core_.deallocate_(ptr, layout) };
         assert_eq!(count_pages_(&bump), 0);
     }
 
@@ -712,13 +866,18 @@ mod tests_ {
         #[cfg(target_pointer_width = "64")]
         {
             let bump = BumpListAlloc::new(PageSize::P256K).expect("64 位支持 256 KiB 页");
-            assert_eq!(bump.page_cells_, 1u16 << 15);
+            assert_eq!(bump.core_.page_cells_, 1u16 << 15);
             let layout = Layout::from_size_align(8, 8).expect("布局合法");
-            let block = bump.allocate_(layout).expect("分配成功");
+            let block = {
+                set_self_(&bump);
+                bump.core_.allocate_(layout)
+            }
+            .expect("分配成功");
             let ptr = block_ptr_(block);
             assert_eq!(count_live_(&bump), 1);
             // SAFETY: 指针来自同一 allocator 与 layout。
-            unsafe { bump.deallocate_(ptr, layout) };
+            set_self_(&bump);
+            unsafe { bump.core_.deallocate_(ptr, layout) };
             // 256 KiB 页也遵循“保留一个空 tail 页”的策略。
             assert_eq!(count_pages_(&bump), 1);
             assert_eq!(count_live_(&bump), 0);

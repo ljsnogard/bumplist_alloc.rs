@@ -8,8 +8,13 @@ license = "AGPL-3.0-or-later"
 
 [features]
 default = []
+# 把 `BumpListAlloc` 暴露成 `abs_denco` 的 `TrArena` / `TrArenaBytes`：
+# `MpDecoder::new_in` 因此可以直接把字符串 / 字节切片分配进同一个分配器。
+denco_arena = ["dep:abs_denco"]
 # 开启后，`BumpListAlloc` 析构时可以把未释放块的警告写到 stderr；
 # 库本身默认不依赖 std。
 std = []
 
 [dependencies]
+# 仅在 `denco_arena` 特性下启用：把本分配器投影成 denco 解码器的 arena。
+abs_denco = { git = "https://gitee.com/lino_snsalias/denco.rs.git", default-features = false, optional = true }

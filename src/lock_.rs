@@ -1,7 +1,8 @@
 //! 无依赖的自旋锁。
 //!
-//! `BumpListAlloc` 的链表锁与每个 Page 的页锁都用它。锁不可重入；持有锁时不得调用
-//! 可能再次获取同一把锁的代码。临界区应只包含指针操作、算术和 BlockHeader 字段写入。
+//! `BumpListAlloc` 的链表锁用它。Page 的页锁不使用本类型：Page 把 owner 指针的最低
+//! 位当作页锁标记（见 `page_`）。锁不可重入；持有锁时不得调用可能再次获取同一把锁的
+//! 代码。临界区应只包含指针操作、算术和 BlockHeader 字段写入。
 
 use core::{
     hint::spin_loop,
@@ -10,7 +11,8 @@ use core::{
 
 /// 一把不可重入的自旋锁。
 ///
-/// 嵌入 Page 头，因此使用 `#[repr(C)]` 固定为 1 字节的 `AtomicBool` 布局。
+/// 嵌入 `BumpListAlloc` 的 `Inner`，因此使用 `#[repr(C)]` 固定为 1 字节的
+/// `AtomicBool` 布局。
 #[repr(C)]
 #[derive(Debug)]
 pub(crate) struct SpinLock {

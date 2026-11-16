@@ -29,11 +29,23 @@
 //! 同一个分配器实例的所有 Page 大小相同。一个分配块必须完整落在一个 Page 内；超过
 //! 页可容纳空间的请求会返回 [`core::alloc::AllocError`]，不会跨页，也不会临时申请大页。
 //!
+//! # 内联 Core
+//!
+//! 与 `A` 无关的页链表、页大小与链表锁放在非泛型 [`BumpListCore`] 中，直接内联在
+//! [`BumpListAlloc`] 里；Page 的 owner 指针指向它。Core 里保存两个单态化函数指针，
+//! 它们从 Core 保存的整分配器指针用 `offset_of!` 取出 `alloc_`，因此不需要 `Box<A>`，也不
+//! 需要每个 Page 保存函数指针。
+//!
+//! 代价是地址稳定性：创建第一个 Page 之后，[`BumpListAlloc`] 不能被移动；需要移动时
+//! 先用 `Box::new` 固定地址，再进行分配。
+//!
 //! # `no_std` 与 `std` 特性
 //!
 //! 默认 `no_std`，只依赖 `core` 与 `alloc`。开启 `std` 特性后，[`BumpListAlloc`]
 //! 析构时会扫描页内块链，并在发现未释放块时把警告写到 stderr；默认构建不输出警告，
 //! 但仍然会通过块链检查页状态。
+
+#![feature(allocator_ext)]
 
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -45,11 +57,15 @@ extern crate alloc;
 extern crate std;
 
 mod alloc_;
+#[cfg(feature = "denco_arena")]
+mod denco_arena_;
 mod error_;
 mod lock_;
 mod page_;
 mod page_size_;
 
 pub use alloc_::BumpListAlloc;
+#[cfg(feature = "denco_arena")]
+pub use denco_arena_::{BumpListArenaError, BumpListBox};
 pub use error_::BumpListAllocError;
 pub use page_size_::{MAX_PAGE_BYTES, MAX_PAGE_CELLS, PageSize};
