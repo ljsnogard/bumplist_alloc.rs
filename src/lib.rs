@@ -2,8 +2,9 @@
 //!
 //! 设计目标：
 //!
-//! - 标准 [`core::alloc::Allocator`]，但**只对 `&BumpListAlloc` 实现**，因此每块分配
-//!   都带有借用生命周期；
+//! - 标准 [`core::alloc::Allocator`]：对 `&BumpListAlloc` 直接实现；`Arc` / `Rc` /
+//!   `Box` 等稳定 `Deref` 句柄通过 [`BumpListAllocRef`] 适配。每块分配仍带有借用
+//!   生命周期；
 //! - 默认 `Send + Sync`，但不实现 `Clone`；
 //! - 每个实例的所有 Page 大小相同，页大小从有限的 [`PageSize`] 选项中选取；
 //! - Page 之间用指针串成双向链表，Page 头与块头都内嵌在 Page 内存中；
@@ -46,7 +47,6 @@
 //! 但仍然会通过块链检查页状态。
 
 #![feature(allocator_ext)]
-
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
@@ -57,6 +57,7 @@ extern crate alloc;
 extern crate std;
 
 mod alloc_;
+mod alloc_ref_;
 #[cfg(feature = "denco_arena")]
 mod denco_arena_;
 mod error_;
@@ -65,6 +66,7 @@ mod page_;
 mod page_size_;
 
 pub use alloc_::BumpListAlloc;
+pub use alloc_ref_::BumpListAllocRef;
 #[cfg(feature = "denco_arena")]
 pub use denco_arena_::{BumpListArenaError, BumpListBox};
 pub use error_::BumpListAllocError;
