@@ -59,7 +59,7 @@ use crate::BumpListAlloc;
 pub struct BumpListAllocRef<D, A = Global>
 where
     D: Deref<Target = BumpListAlloc<A>>,
-    A: Allocator,
+    A: Allocator + Send,
 {
     inner_: D,
     _use_a_: PhantomData<fn() -> A>,
@@ -68,7 +68,7 @@ where
 impl<D, A> BumpListAllocRef<D, A>
 where
     D: Deref<Target = BumpListAlloc<A>>,
-    A: Allocator,
+    A: Allocator + Send,
 {
     /// 由稳定句柄构造。
     ///
@@ -94,7 +94,7 @@ where
 impl<D, A> Clone for BumpListAllocRef<D, A>
 where
     D: Clone + Deref<Target = BumpListAlloc<A>>,
-    A: Allocator,
+    A: Allocator + Send,
 {
     fn clone(&self) -> Self {
         BumpListAllocRef {
@@ -107,7 +107,7 @@ where
 impl<D, A> Deref for BumpListAllocRef<D, A>
 where
     D: Deref<Target = BumpListAlloc<A>>,
-    A: Allocator,
+    A: Allocator + Send,
 {
     type Target = D::Target;
 
@@ -119,7 +119,7 @@ where
 impl<D, A> fmt::Debug for BumpListAllocRef<D, A>
 where
     D: Deref<Target = BumpListAlloc<A>> + fmt::Debug,
-    A: Allocator,
+    A: Allocator + Send,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("BumpListAllocRef")
@@ -133,7 +133,7 @@ where
 unsafe impl<D, A> Allocator for BumpListAllocRef<D, A>
 where
     D: Deref<Target = BumpListAlloc<A>>,
-    A: Allocator,
+    A: Allocator + Send,
 {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         let bump: &BumpListAlloc<A> = self.inner_.deref();
@@ -152,7 +152,7 @@ where
 unsafe impl<D, A> AllocatorClone for BumpListAllocRef<D, A>
 where
     D: Clone + Deref<Target = BumpListAlloc<A>>,
-    A: AllocatorClone,
+    A: AllocatorClone + Send,
 {}
 
 #[cfg(feature = "denco_arena")]
@@ -166,7 +166,7 @@ mod denco_impls_ {
     impl<'alloc, D, A> TrArena<'alloc> for BumpListAllocRef<D, A>
     where
         D: 'alloc + Deref<Target = BumpListAlloc<A>>,
-        A: 'alloc + Allocator,
+        A: 'alloc + Allocator + Send,
     {
         type Error = <BumpListAlloc<A> as TrArena<'alloc>>::Error;
 
@@ -194,7 +194,7 @@ mod denco_impls_ {
     impl<'alloc, D, A> TrArenaBytes<'alloc> for BumpListAllocRef<D, A>
     where
         D: 'alloc + Deref<Target = BumpListAlloc<A>>,
-        A: 'alloc + Allocator,
+        A: 'alloc + Allocator + Send,
     {
         type AllocBytesAsync<'a> = <BumpListAlloc<A> as TrArenaBytes<'alloc>>::AllocBytesAsync<'a>
         where
@@ -214,7 +214,7 @@ mod denco_impls_ {
     impl<'alloc, D, A> TrAllocSource<'alloc, BumpListAllocRef<D, A>> for BumpListAllocRef<D, A>
     where
         D: 'alloc + Clone + Deref<Target = BumpListAlloc<A>>,
-        A: 'alloc + Allocator,
+        A: 'alloc + Allocator + Send,
     {
         fn alloc_from(arena: &'alloc BumpListAllocRef<D, A>) -> Self {
             arena.clone()

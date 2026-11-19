@@ -48,7 +48,7 @@ impl Error for BumpListArenaError {}
 
 impl<'alloc, A> TrArena<'alloc> for BumpListAlloc<A>
 where
-    A: Allocator,
+    A: Allocator + Send,
 {
     type Error = BumpListArenaError;
 
@@ -90,7 +90,7 @@ where
 
 impl<'alloc, A> TrArenaBytes<'alloc> for BumpListAlloc<A>
 where
-    A: Allocator,
+    A: Allocator + Send,
 {
     type AllocBytesAsync<'f> =
         future::Ready<Result<&'alloc [u8], BumpListArenaError>>

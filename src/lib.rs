@@ -5,7 +5,7 @@
 //! - 标准 [`core::alloc::Allocator`]：对 `&BumpListAlloc` 直接实现；`Arc` / `Rc` /
 //!   `Box` 等稳定 `Deref` 句柄通过 [`BumpListAllocRef`] 适配。每块分配仍带有借用
 //!   生命周期；
-//! - 默认 `Send + Sync`，但不实现 `Clone`；
+//! - `A: Send` 时 `Send + Sync`（不要求 `A: Sync`），但不实现 `Clone`；
 //! - 每个实例的所有 Page 大小相同，页大小从有限的 [`PageSize`] 选项中选取；
 //! - Page 之间用指针串成双向链表，Page 头与块头都内嵌在 Page 内存中；
 //! - 每个 Page 有独立的页锁，普通归还只需要页锁；只有空页摘链才需要 allocator 的

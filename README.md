@@ -4,8 +4,9 @@
 [`core::alloc::Allocator`](https://doc.rust-lang.org/core/alloc/trait.Allocator.html)，
 但只对 `&BumpListAlloc` 实现，因此每块分配都带有借用生命周期。
 
-设计目标是“不带 `Retain<T>` 的 sw-scope”：适合小对象 arena，不实现 `Clone`，默认
-`Send + Sync`，空 Page 可以归还给底层分配器。
+设计目标是“不带 `Retain<T>` 的 sw-scope”：适合小对象 arena，不实现 `Clone`；
+底层分配器 `A: Send` 时 `BumpListAlloc` 是 `Send + Sync`（对 `A` 的访问由内部锁串行化，
+不要求 `A: Sync`），空 Page 可以归还给底层分配器。
 
 ## 快速开始
 
@@ -114,7 +115,8 @@ cargo test --features std
   `MpDecoder::new_in` 可以把字符串 / 字节切片分配进同一个分配器；`TrArena::Ref<T>` 是
   `Box`，析构时运行 `T` 的析构函数并调用 `Page::release_` 把块归还到页内；
 - 不实现 `Clone`；需要共享时使用 `&` 或 `Arc`；
-- 默认 `A = Global`；`A: Send + Sync` 时 `BumpListAlloc` 是 `Send + Sync`；
+- 默认 `A = Global`；`A: Send` 时 `BumpListAlloc` 是 `Send + Sync`（`A` 的访问由
+  `backing_lock_` 串行化，不要求 `A: Sync`）；
 - 所有 Page 同大小；最多缓存一个空 tail Page，其余空页归还；
 - `no_std`，无外部依赖；锁为自旋锁。
 

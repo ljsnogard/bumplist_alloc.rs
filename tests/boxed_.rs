@@ -3,8 +3,9 @@
 //! Integration tests for the public API of `Box<'a, T>`.
 
 use core::{
-    alloc::{Allocator, Layout},
+    alloc::{AllocError, Allocator, Layout},
     borrow::{Borrow, BorrowMut},
+    cell::Cell,
     error::Error,
     fmt,
     future::Future,
@@ -13,9 +14,11 @@ use core::{
     marker::PhantomPinned,
     mem,
     pin::Pin,
+    ptr::NonNull,
     task::{Context, Poll, Waker},
 };
 use std::{
+    alloc::Global,
     collections::hash_map::DefaultHasher,
     string::String,
     sync::{
@@ -26,9 +29,9 @@ use std::{
 
 use bumplist_alloc::{Box, BumpListAlloc, PageSize};
 
-/// 在默认 arena 中分配一个 `T`，返回拥有它的 `Box`。
-fn in_arena_<'a, T>(arena: &'a BumpListAlloc, value: T) -> Box<'a, T> {
-    let block = <&BumpListAlloc as Allocator>::allocate(&arena, Layout::new::<T>())
+/// 在任意 `BumpListAlloc<A>` 中分配一个 `T`，返回拥有它的 `Box`。
+fn in_arena_with_<'a, A: Allocator + Send, T>(arena: &'a BumpListAlloc<A>, value: T) -> Box<'a, T> {
+    let block = <&BumpListAlloc<A> as Allocator>::allocate(&arena, Layout::new::<T>())
         .expect("arena 分配应当成功");
     // SAFETY: `block` 来自 `arena` 且按 `Layout::new::<T>()` 分配；这里写入一次并
     // 立即交给 `Box` 独占。
@@ -39,6 +42,11 @@ fn in_arena_<'a, T>(arena: &'a BumpListAlloc, value: T) -> Box<'a, T> {
     }
 }
 
+/// 在默认 arena（`A = Global`）中分配一个 `T`。
+fn in_arena_<'a, T>(arena: &'a BumpListAlloc, value: T) -> Box<'a, T> {
+    in_arena_with_(arena, value)
+}
+
 fn hash_of_<H: Hash>(value: &H) -> u64 {
     let mut hasher = DefaultHasher::new();
     value.hash(&mut hasher);
@@ -46,6 +54,10 @@ fn hash_of_<H: Hash>(value: &H) -> u64 {
 }
 
 fn assert_unpin_<T: Unpin>() {}
+
+fn assert_send_<T: Send>() {}
+
+fn assert_send_sync_<T: Send + Sync>() {}
 
 fn assert_fused_<I: FusedIterator>(_: &I) {}
 
@@ -378,4 +390,121 @@ fn clone_zst_() {
     drop(original);
     drop(copy);
     assert_eq!(ZST_DROPS.load(Ordering::SeqCst), 2);
+}
+
+/// 测试目标：`Box<'a, T>` 在 `T: Send + Sync` 时实现 `Send + Sync`。
+/// Test goal: `Box<'a, T>` is `Send + Sync` when `T: Send + Sync`.
+///
+/// - 手段：用编译期 trait 断言检查 `Box<'static, u32>` 与 `Box<'static, dyn Trait>`
+///   的自动/手写实现。
+/// - 判定：`u32` 的 `Box` 满足 `Send + Sync`；只带 `Send` 的 trait object 只满足
+///   `Send`，带 `Sync` 的 trait object 同时满足两者。
+///
+/// - Means: use compile-time trait assertions on `Box<'static, u32>` and boxed trait
+///   objects.
+/// - Verdict: the `u32` box is both `Send` and `Sync`; a `Send`-only trait object is only
+///   `Send`, while a `Send + Sync` trait object satisfies both.
+#[test]
+fn box_is_send_sync_() {
+    trait SendOnly: Send {}
+    trait SendSync: Send + Sync {}
+
+    assert_send_sync_::<Box<'static, u32>>();
+    assert_send_::<Box<'static, dyn SendOnly>>();
+    assert_send_sync_::<Box<'static, dyn SendSync>>();
+}
+
+/// 测试目标：`Box` 可以把块的所有权交给另一个线程并在线程内析构。
+/// Test goal: a `Box` can move its block ownership to another thread and drop it there.
+///
+/// - 手段：在 4 KiB 页 arena 中装箱一个 `u32`，用 `std::thread::scope` 把它移动到
+///   子线程，在子线程读取并析构。
+/// - 判定：子线程读到原值；离开作用域后 arena 正常析构，没有块泄漏。
+///
+/// - Means: box a `u32` in a 4 KiB-page arena, move it into a scoped child thread, read
+///   and drop it there.
+/// - Verdict: the child thread reads the original value and the arena drops cleanly.
+#[test]
+fn box_moves_across_threads_() {
+    let arena = BumpListAlloc::new(PageSize::P4K).expect("4 KiB 页应当受支持");
+    let boxed = in_arena_(&arena, 5u32);
+
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            assert_eq!(*boxed, 5);
+            drop(boxed);
+        });
+    });
+}
+
+/// 测试目标：`&Box` 可以跨线程共享，且多个线程可以同时克隆同一个块。
+/// Test goal: `&Box` is shareable across threads and several threads may clone the same
+/// block concurrently.
+///
+/// - 手段：装箱一个 `u32`，在 scoped 子线程中读取 `&Box` 并克隆一份，克隆后再改值。
+/// - 判定：子线程读到原值；克隆得到独立块，修改克隆不影响原值。
+///
+/// - Means: box a `u32`, read the `&Box` from a scoped child thread, clone it there and
+///   mutate the clone.
+/// - Verdict: the child observes the original value and mutating the clone leaves the
+///   original untouched.
+#[test]
+fn box_shared_across_threads_() {
+    let arena = BumpListAlloc::new(PageSize::P4K).expect("4 KiB 页应当受支持");
+    let boxed = in_arena_(&arena, 5u32);
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            assert_eq!(*boxed, 5);
+            let mut copy = boxed.clone();
+            *copy += 1;
+            assert_eq!(*copy, 6);
+        });
+    });
+
+    assert_eq!(*boxed, 5);
+}
+
+/// 只用 `Cell` 计数的 `Send + !Sync` 底层分配器，验证锁可以把 A 的访问降到 `Send`。
+struct CellAlloc(Cell<u8>);
+
+unsafe impl Allocator for CellAlloc {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        self.0.set(self.0.get().wrapping_add(1));
+        Global.allocate(layout)
+    }
+
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        unsafe { Global.deallocate(ptr, layout) }
+    }
+}
+
+/// 测试目标：底层分配器是 `Send + !Sync` 时，`BumpListAlloc` 与 `Box` 仍可跨线程使用。
+/// Test goal: `BumpListAlloc` and `Box` remain usable across threads even when the
+/// backing allocator is `Send + !Sync`.
+///
+/// - 手段：用内部含 `Cell` 的 `Send + !Sync` 分配器构造 1 KiB 页 arena，编译期断言
+///   `&BumpListAlloc<CellAlloc>: Send + Sync`；装箱 600 字节数组后移动到子线程克隆，
+///   让 A::allocate / deallocate 在另一线程发生。
+/// - 判定：`&arena` 满足 `Send + Sync`；子线程克隆出的内容与原值一致；没有数据竞争。
+///
+/// - Means: build a 1 KiB-page arena with a `Send + !Sync` allocator containing a
+///   `Cell`, assert `&BumpListAlloc<CellAlloc>: Send + Sync`, move a 600-byte array box
+///   to a child thread and clone it there so A is called from another thread.
+/// - Verdict: `&arena` is `Send + Sync`, the clone matches the original, and no data race
+///   is reported.
+#[test]
+fn send_not_sync_arena_() {
+    assert_send_sync_::<&BumpListAlloc<CellAlloc>>();
+
+    let arena =
+        BumpListAlloc::new_in(CellAlloc(Cell::new(0)), PageSize::P1K).expect("1 KiB 页应当受支持");
+    let boxed = in_arena_with_(&arena, [9u8; 600]);
+
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let copy = boxed.clone();
+            assert_eq!(*copy, [9u8; 600]);
+        });
+    });
 }

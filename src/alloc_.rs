@@ -47,7 +47,7 @@ type PageDeallocFn = unsafe fn(*const (), NonNull<u8>, Layout);
 /// # Safety
 ///
 /// `base` 必须指向一个真实的 `BumpListAlloc<A>`，且其地址在调用期间有效。
-unsafe fn allocator_ptr_<A: Allocator>(base: *const ()) -> *const A {
+unsafe fn allocator_ptr_<A: Allocator + Send>(base: *const ()) -> *const A {
     // SAFETY: 字段偏移由编译器给出；base 带整个结构体的 provenance。
     unsafe {
         base.cast::<u8>()
@@ -59,7 +59,7 @@ unsafe fn allocator_ptr_<A: Allocator>(base: *const ()) -> *const A {
 /// # Safety
 ///
 /// `base` 必须指向一个真实且仍然存活的 `BumpListAlloc<A>`。
-unsafe fn alloc_page_<A: Allocator>(
+unsafe fn alloc_page_<A: Allocator + Send>(
     base: *const (),
     layout: Layout,
 ) -> Result<NonNull<[u8]>, AllocError> {
@@ -71,7 +71,7 @@ unsafe fn alloc_page_<A: Allocator>(
 /// # Safety
 ///
 /// `base` 必须指向一个真实且仍然存活的 `BumpListAlloc<A>`，且 `page`/`layout` 来自该分配器。
-unsafe fn dealloc_page_<A: Allocator>(base: *const (), page: NonNull<u8>, layout: Layout) {
+unsafe fn dealloc_page_<A: Allocator + Send>(base: *const (), page: NonNull<u8>, layout: Layout) {
     // SAFETY: 由调用方保证 base 指向 BumpListAlloc<A>。
     let alloc = unsafe { &*allocator_ptr_::<A>(base) };
     // SAFETY: 由调用方保证 page/layout 契约。
@@ -92,6 +92,10 @@ pub(crate) struct BumpListCore {
     page_cells_: u16,
     page_bytes_: usize,
     list_lock_: SpinLock,
+    /// 串行化对底层分配器 `A` 的所有 allocate / deallocate 调用。
+    ///
+    /// `A: Send` 只保证 A 可以独占地在任意线程使用；并发调用仍需要本锁。
+    backing_lock_: SpinLock,
     inner_: UnsafeCell<Inner>,
     backing_alloc_: PageAllocFn,
     backing_dealloc_: PageDeallocFn,
@@ -100,7 +104,7 @@ pub(crate) struct BumpListCore {
 
 impl BumpListCore {
     /// 用底层分配器类型与页大小构造核心；数据指针在第一次操作前刷新。
-    fn new_<A: Allocator>(page_size: PageSize) -> Result<Self, BumpListAllocError> {
+    fn new_<A: Allocator + Send>(page_size: PageSize) -> Result<Self, BumpListAllocError> {
         if !page_size.is_supported() {
             return Err(BumpListAllocError::UnsupportedPageSize { page_size });
         }
@@ -113,6 +117,7 @@ impl BumpListCore {
             page_cells_: cells as u16,
             page_bytes_: page_size.bytes(),
             list_lock_: SpinLock::new(),
+            backing_lock_: SpinLock::new(),
             inner_: UnsafeCell::new(Inner::empty_()),
             backing_alloc_: alloc_page_::<A>,
             backing_dealloc_: dealloc_page_::<A>,
@@ -126,7 +131,7 @@ impl BumpListCore {
     }
 
     /// 把整分配器地址写入 Core；`offset_of!` 之后从这里取 `alloc_`。
-    pub(crate) fn set_self_ptr_<A: Allocator>(&self, this: &BumpListAlloc<A>) {
+    pub(crate) fn set_self_ptr_<A: Allocator + Send>(&self, this: &BumpListAlloc<A>) {
         self.self_ptr_.store(
             this as *const BumpListAlloc<A> as *mut (),
             Ordering::Release,
@@ -147,7 +152,11 @@ impl BumpListCore {
             .map_err(|_| AllocError)?;
         let base = self.self_ptr_();
         // SAFETY: base 在最近一次操作前刷新为整个 BumpListAlloc<A>；A 仍然存活。
-        let mem = unsafe { (self.backing_alloc_)(base, layout) }?;
+        // `backing_lock_` 串行化所有对 A 的调用，因此 A 只需要 `Send`。
+        let mem = {
+            let _guard = self.backing_lock_.lock_();
+            unsafe { (self.backing_alloc_)(base, layout) }
+        }?;
         // SAFETY: mem 是刚申请、至少 page_bytes 字节、按 Page 对齐的独占内存；
         // Page 头占用不超过 page_bytes。
         Ok(unsafe { Page::init_in_place_(mem, NonNull::from(self)) })
@@ -162,7 +171,11 @@ impl BumpListCore {
         ) };
         let base = self.self_ptr_();
         // SAFETY: 同上；page/layout 来自本分配器，A 先于 Core 存续。
-        unsafe { (self.backing_dealloc_)(base, page.cast::<u8>(), layout) };
+        // `backing_lock_` 串行化所有对 A 的调用，因此 A 只需要 `Send`。
+        {
+            let _guard = self.backing_lock_.lock_();
+            unsafe { (self.backing_dealloc_)(base, page.cast::<u8>(), layout) };
+        }
     }
 
     /// 把新页追加到 `tail` 之后，并更新 `head_` / `tail_`。
@@ -438,6 +451,13 @@ impl BumpListCore {
 ///
 /// `BumpListAlloc` 本身不实现 `Clone`；需要共享时使用 `&` 或 `Arc`。
 ///
+/// # 线程安全
+///
+/// 类型参数要求 `A: Send`。所有对底层分配器 `A` 的调用（页申请 / 页归还）都由
+/// `BumpListCore` 的 `backing_lock_` 串行化，因此 `BumpListAlloc<A>` 是
+/// `Send + Sync`，不要求 `A: Sync`。`A: !Send` 的分配器不能用于本类型；例如需要
+/// trait object 时，应使用 `&(dyn Allocator + Sync)` 而不是 `&dyn Allocator`。
+///
 /// # 地址稳定性
 ///
 /// `BumpListCore` 直接内联在 `BumpListAlloc` 里；Page 的 owner 指向它。Core 保存一个
@@ -446,7 +466,7 @@ impl BumpListCore {
 ///
 /// **地址稳定性**：Page 的 owner 指向内联 Core，因此创建第一个 Page 之后
 /// `BumpListAlloc` 不能被移动；需要移动请先 `Box::new` / `pin` 固定地址再分配。
-pub struct BumpListAlloc<A: Allocator = Global> {
+pub struct BumpListAlloc<A: Allocator + Send = Global> {
     /// 非泛型核心；Page 的 owner 指向它。声明在 `alloc_` 之前，因此先于 A 析构。
     pub(crate) core_: BumpListCore,
 
@@ -460,21 +480,22 @@ pub struct BumpListAlloc<A: Allocator = Global> {
 unsafe impl<A: Allocator + Send> Send for BumpListAlloc<A> {}
 
 // SAFETY: 共享 `&BumpListAlloc` 时，链表由链表锁保护，页状态由页锁保护；
-// `A: Sync` 保证底层分配器可被并发借用。Page 的 `links_` / `state_` 使用
+// 所有对底层分配器 `A` 的调用都由 `backing_lock_` 串行化，`A: Send` 足以让
+// 这把锁把 A 的独占访问安全地借给任意线程。Page 的 `links_` / `state_` 使用
 // `UnsafeCell`，分别由两把锁保护不相交字段。
-unsafe impl<A: Allocator + Sync> Sync for BumpListAlloc<A> {}
+unsafe impl<A: Allocator + Send> Sync for BumpListAlloc<A> {}
 
-impl<A: Allocator> Drop for BumpListAlloc<A> {
+impl<A: Allocator + Send> Drop for BumpListAlloc<A> {
     fn drop(&mut self) {
         // 刷新自指针到当前地址；随后 `core_` 字段先析构并使用它归还所有页。
         self.core_.set_self_ptr_(self);
     }
 }
 
-impl<A: Allocator> BumpListAlloc<A> {
+impl<A: Allocator + Send> BumpListAlloc<A> {
     /// 使用指定的底层分配器与页大小创建一个空 allocator。
     ///
-    /// 构造时不申请 Page，第一次分配才会申请。
+    /// 底层分配器 `A` 必须满足 `Send`。构造时不申请 Page，第一次分配才会申请。
     ///
     /// # Errors
     ///
@@ -572,7 +593,7 @@ impl Drop for BumpListCore {
     }
 }
 
-unsafe impl<A: Allocator> Allocator for &BumpListAlloc<A> {
+unsafe impl<A: Allocator + Send> Allocator for &BumpListAlloc<A> {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         self.core_.set_self_ptr_(self);
         self.core_.allocate_(layout)
@@ -585,7 +606,7 @@ unsafe impl<A: Allocator> Allocator for &BumpListAlloc<A> {
     }
 }
 
-unsafe impl<A: Allocator> AllocatorClone for &BumpListAlloc<A>
+unsafe impl<A: Allocator + Send> AllocatorClone for &BumpListAlloc<A>
 {}
 
 #[cfg(test)]
