@@ -107,8 +107,8 @@ pub(crate) struct PageState {
 /// Page 头。
 ///
 /// 字段按大小降序手动布置：`links_`（2 个指针）、`state_`（8 字节）、`owner_`
-/// （指向非泛型 [`BumpListCore`] 的 owner 指针，低 1 位兼作页锁）。64 位下 32 字节，
-/// 32 位下 20 字节，分别占 4/5 个 cell。
+/// （指向非泛型 [`BumpListCore`] 的 owner 指针，低 1 位兼作页锁；开启 `big_page` 时
+/// 次低位标记大页）。64 位下 32 字节，32 位下 20 字节，分别占 4/5 个 cell。
 ///
 /// `links_` 由 `BumpListCore` 的链表锁保护，`state_` 由页锁保护。owner 指针指向
 /// 创建本页的 `BumpListCore`；它的最低位一定是 0（Core 至少按指针宽度对齐），因此
@@ -127,6 +127,18 @@ pub(crate) struct Page {
 
 /// owner 指针的最低有效位：页锁占用标记。
 const LOCK_BIT: usize = 1;
+
+/// owner 指针的次低位：大页标记；仅在 `big_page` 特性开启时使用。
+#[cfg(feature = "big_page")]
+pub(crate) const LARGE_BIT: usize = 1 << 1;
+
+/// 从 owner 指针中剥离所有标记位。
+#[cfg(feature = "big_page")]
+const PAGE_TAG_MASK: usize = LOCK_BIT | LARGE_BIT;
+
+/// 未开启大页特性时，owner 指针只有页锁一位标记。
+#[cfg(not(feature = "big_page"))]
+const PAGE_TAG_MASK: usize = LOCK_BIT;
 
 const _: () = assert!(mem::size_of::<PageState>() == 8);
 const _: () = assert!(mem::size_of::<PageLinks>() == 2 * PTR);
@@ -174,6 +186,24 @@ impl Page {
         owner: NonNull<BumpListCore>,
         first_cell: CellIndex,
     ) -> NonNull<Self> {
+        // SAFETY: 由调用方保证 init_in_place_with_tag_ 的契约；普通页不带 kind 标记。
+        unsafe { Self::init_in_place_with_tag_(mem, owner, first_cell, 0) }
+    }
+
+    /// 与 [`Page::init_in_place_`] 相同，但允许在 owner 指针上附加 kind 标记。
+    ///
+    /// `tag` 只能是 0 或 `LARGE_BIT`；大页初始化由 `big_page_` 传入
+    /// `LARGE_BIT`。
+    ///
+    /// # Safety
+    ///
+    /// 同 [`Page::init_in_place_`]；调用方必须在挂链前独占本页。
+    pub(crate) unsafe fn init_in_place_with_tag_(
+        mem: NonNull<[u8]>,
+        owner: NonNull<BumpListCore>,
+        first_cell: CellIndex,
+        tag: usize,
+    ) -> NonNull<Self> {
         let page_cells = mem.len() / PTR;
         let first = first_cell as usize;
         assert!(
@@ -192,10 +222,12 @@ impl Page {
         let base = mem.cast::<Self>();
         let owner_ptr = owner.as_ptr();
         debug_assert_eq!(
-            owner_ptr.addr() & LOCK_BIT,
+            owner_ptr.addr() & PAGE_TAG_MASK,
             0,
-            "owner 必须按至少 2 字节对齐"
+            "owner 必须按指针宽度对齐"
         );
+        debug_assert_eq!(tag & !PAGE_TAG_MASK, 0, "tag 必须是合法的 owner 标记");
+        let owner_ptr = owner_ptr.map_addr(|addr| addr | tag);
         // SAFETY: 调用方保证 mem 是足够的、对齐的独占内存；Page 头写在起始处。
         unsafe {
             base.as_ptr().write(Self {
@@ -249,12 +281,12 @@ impl Page {
         }
     }
 
-    /// owner 指针（去掉页锁标记）。
+    /// owner 指针（去掉页锁与大页标记）。
     pub(crate) fn owner_ptr_(&self) -> NonNull<BumpListCore> {
         let raw = self
             .owner_
             .load(Ordering::Acquire)
-            .map_addr(|addr| addr & !LOCK_BIT);
+            .map_addr(|addr| addr & !PAGE_TAG_MASK);
         // SAFETY: owner 指针在 Page 初始化时写入，永不为空。
         unsafe { NonNull::new_unchecked(raw) }
     }
@@ -299,12 +331,43 @@ impl Page {
         unsafe { (*self.links_.get()).next_ = next };
     }
 
+    /// 本页是否为大页（`owner_` 的 [`LARGE_BIT`]）。
+    ///
+    /// kind 在 `Page` 初始化后不再变化，因此不需要页锁。
+    #[cfg(feature = "big_page")]
+    pub(crate) fn is_large_(&self) -> bool {
+        self.owner_.load(Ordering::Acquire).addr() & LARGE_BIT != 0
+    }
+
+    /// 在独占初始化阶段把本页登记为“只放一个块”的页。
+    ///
+    /// 写入块头 `order_flags_ = header_cell`、`next_free_ = header_cell + 1`，并把
+    /// `PageState.used_` 设为 1。大页的 `cells_` 由 `init_in_place_with_tag_` 计算为
+    /// 1，因此现有 `release_locked_` 会把这次释放视为整页变空。
+    ///
+    /// # Safety
+    ///
+    /// 调用方必须独占本页且尚未挂链；`header_cell + 1` 必须落在页内。
+    #[cfg(feature = "big_page")]
+    pub(crate) unsafe fn init_single_block_(&self, page: NonNull<Page>, header_cell: CellIndex) {
+        let header = Self::header_at_(page, header_cell);
+        // SAFETY: 调用方保证 header_cell 落在页内且独占访问。
+        unsafe {
+            (*header).order_flags_ = header_cell;
+            (*header).next_free_ = header_cell + 1;
+            let state = &mut *self.state_.get();
+            debug_assert_eq!(state.base_, header_cell);
+            debug_assert_eq!(state.cells_, 1);
+            state.used_ = 1;
+        }
+    }
+
     /// 取得某个页内绝对 cell 下标处的 BlockHeader 指针。
     ///
     /// # Safety
     ///
     /// `page` 必须是有效的 Page 首指针；`cell` 必须落在页内。
-    fn header_at_(page: NonNull<Page>, cell: CellIndex) -> *mut BlockHeader {
+    pub(crate) fn header_at_(page: NonNull<Page>, cell: CellIndex) -> *mut BlockHeader {
         let base = page.cast::<u8>().as_ptr();
         // SAFETY: 由调用方保证 cell 落在页内；page 指针带整页 provenance。
         unsafe { base.add(cell as usize * PTR).cast::<BlockHeader>() }

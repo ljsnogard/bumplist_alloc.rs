@@ -74,11 +74,13 @@ fn zero_sized_allocation_does_not_create_page() {
     assert_eq!(counters.allocs(), counters.deallocs());
 }
 
-/// 测试目标：固定页大小下，超过页可容纳空间的请求返回 `AllocError`，且不追加 Page。
-/// Test goal: With fixed page sizes, an oversized request returns `AllocError` and appends
+/// 测试目标：未开启 `big_page` 时，超过页可容纳空间的请求返回 `AllocError`，且不追加
+/// Page。
+/// Test goal: Without `big_page`, an oversized request returns `AllocError` and appends
 /// no page.
 /// - 手段 / Method: 1 KiB 页上直接分配 8 KiB，并用 `Vec::try_reserve` 触发扩容失败。
 /// - 判定 / Assertion: 两次尝试都返回错误；计数分配器的申请次数与构造后相同。
+#[cfg(not(feature = "big_page"))]
 #[test]
 fn fixed_page_size_limits_allocation() {
     let (alloc, counters) = CountingAlloc::new();

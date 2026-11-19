@@ -11,9 +11,17 @@ default = []
 # 把 `BumpListAlloc` 暴露成 `abs_denco` 的 `TrArena` / `TrArenaBytes`：
 # `MpDecoder::new_in` 因此可以直接把字符串 / 字节切片分配进同一个分配器。
 denco_arena = ["dep:abs_denco"]
+# 开启后，超过普通页容量的请求由独立的 `BigPageList` 承接：每次分配一个只放一个块的
+# 专用 Page，释放后立即把整页归还给 backing allocator。关闭时保持旧行为
+# （超页请求返回 `AllocError`）。
+big_page = []
 # 开启后，`BumpListAlloc` 析构时可以把未释放块的警告写到 stderr；
 # 库本身默认不依赖 std。
 std = []
+
+[[bench]]
+name = "small_alloc"
+harness = false
 
 [dependencies]
 # 仅在 `denco_arena` 特性下启用：把本分配器投影成 denco 解码器的 arena。
