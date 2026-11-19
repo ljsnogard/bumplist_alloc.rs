@@ -1,10 +1,10 @@
 //! 把「稳定 `Deref<Target = BumpListAlloc>` 的句柄」适配成 [`Allocator`]。
 //!
-//! [`BumpListAlloc`] 在创建第一个 Page 之后不能移动，因此本 crate 只为
-//! `&BumpListAlloc` 实现 [`Allocator`]。`Arc<BumpListAlloc, _>` / `Rc<...>` /
-//! `Box<...>` 拥有稳定的目标地址，却不能直接实现 [`Allocator`]：`Allocator` 是
-//! core 的 trait，而 `Arc` / `Rc` / `Box` 都不是本 crate 的本地类型，孤儿规则不允许
-//! 为它们写 impl。
+//! [`BumpListAlloc`] 本身现在只是一个指向堆上第一页的指针，可以安全移动；它仍然只为
+//! `&BumpListAlloc` 实现 [`Allocator`]，因为分配块的生命周期应由借用期携带，而不是由
+//! allocator 的所有权携带。`Arc<BumpListAlloc, _>` / `Rc<...>` / `Box<...>` 拥有稳定
+//! 的目标地址，却不能直接实现 [`Allocator`]：`Allocator` 是 core 的 trait，而 `Arc` /
+//! `Rc` / `Box` 都不是本 crate 的本地类型，孤儿规则不允许为它们写 impl。
 //!
 //! [`BumpListAllocRef`] 是本地 newtype：它只转发 [`Allocator`] / [`AllocatorClone`]，
 //! 在 `denco_arena` 特性下再转发 `TrArena` / `TrArenaBytes` / `TrAllocSource`。
@@ -12,10 +12,11 @@
 //!
 //! # `alloc_ref_`: a local adapter for stable `Deref` handles
 //!
-//! `BumpListAlloc` cannot move after its first page, so `Allocator` is implemented for
-//! `&BumpListAlloc`. `Arc` / `Rc` / `Box` own a stable target but are foreign types, so the
-//! orphan rule forbids implementing `Allocator` for them directly. `BumpListAllocRef` is the
-//! local newtype that forwards the allocator (and denco arena) traits.
+//! `BumpListAlloc` is now a movable pointer to its heap-allocated first page, but
+//! `Allocator` is still implemented for `&BumpListAlloc` so each block carries a borrow.
+//! `Arc` / `Rc` / `Box` own a stable target but are foreign types, so the orphan rule
+//! forbids implementing `Allocator` for them directly. `BumpListAllocRef` is the local
+//! newtype that forwards the allocator (and denco arena) traits.
 
 use alloc::alloc::Global;
 use core::{
@@ -33,16 +34,17 @@ use crate::BumpListAlloc;
 /// 典型用法是拥有 per-request / per-session arena：
 ///
 /// ```ignore
-/// let root = Box::new(BumpListAlloc::new(PageSize::P2K)?);
-/// let inner = BumpListAlloc::new(PageSize::P2K)?;
-/// let handle = BumpListAllocRef::new(Arc::new_in(inner, &*root));
-/// let mut headers: Headers<BumpListAllocRef<Arc<BumpListAlloc, &BumpListAlloc>>> =
+/// let arena = Arc::new(BumpListAlloc::new(PageSize::P2K)?);
+/// let handle = BumpListAllocRef::new(Arc::clone(&arena));
+/// let mut headers: Headers<BumpListAllocRef<Arc<BumpListAlloc>>> =
 ///     Headers::new_in(handle.clone());
 /// ```
 ///
-/// 包装本身不分配、不持有 Page；它只是把 `&*inner` 的 [`Allocator`] 实现投影到
+/// 包装本身不分配、不持有 Page；它只是把 `&*arena` 的 [`Allocator`] 实现投影到
 /// 句柄类型上。`Clone` 克隆的是句柄，不是 arena；所有克隆共享同一个
-/// [`BumpListAlloc`]。
+/// [`BumpListAlloc`]。`BumpListAlloc` 自身已经可以安全移动，因此普通的 `&arena`
+/// 通常不需要再包一层；`BumpListAllocRef` 主要服务于 `Arc` / `Rc` / `Box` 这类
+/// 需要转发 `Allocator` 的外部句柄。
 ///
 /// # Examples
 ///
@@ -70,9 +72,11 @@ where
     D: Deref<Target = BumpListAlloc<A>>,
     A: Allocator + Send,
 {
-    /// 由稳定句柄构造。
+    /// 由 `Deref<Target = BumpListAlloc>` 句柄构造。
     ///
-    /// 安全性由 [`TrStableDeref`] 的实现者承担：`D` 必须保证目标地址稳定且 clone 等价。
+    /// 安全性由句柄类型保证：`D` 的 `Deref` 必须始终交出同一个 `BumpListAlloc`。
+    /// `BumpListAlloc` 自身已经可以安全移动，因此不再要求目标地址绝对固定；但
+    /// `D: Clone` 仍应克隆出指向同一 arena 的句柄，而不是复制出一份独立的 arena。
     pub const fn new(inner: D) -> Self {
         BumpListAllocRef {
             inner_: inner,
@@ -128,8 +132,9 @@ where
     }
 }
 
-// SAFETY: 所有方法都转发给 `&*self.inner_` 的 `Allocator` 实现；
-// `TrStableDeref` 保证该 `BumpListAlloc` 在句柄存活期间地址稳定。
+// SAFETY: 所有方法都转发给 `&*self.inner_` 的 `Allocator` 实现；`D` 的 `Deref`
+// 必须交出同一个 `BumpListAlloc`，而 `BumpListAlloc` 的页与 Core 都在堆上，句柄移动
+// 不会影响它们。
 unsafe impl<D, A> Allocator for BumpListAllocRef<D, A>
 where
     D: Deref<Target = BumpListAlloc<A>>,
@@ -147,7 +152,7 @@ where
     }
 }
 
-// SAFETY: `D: Clone` 的克隆必须指向同一个稳定目标（见 `TrStableDeref` 的安全契约）；
+// SAFETY: `D: Clone` 的克隆必须指向同一个 arena（见 `new` 的说明）；
 // 克隆出来的包装共享同一个底层 arena，因此任意 clone 都能释放另一 clone 分配的块。
 unsafe impl<D, A> AllocatorClone for BumpListAllocRef<D, A>
 where

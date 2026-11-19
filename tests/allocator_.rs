@@ -46,15 +46,18 @@ fn vec_and_box_share_borrowed_allocator() {
     );
 }
 
-/// 测试目标：零尺寸分配不创建 Page，返回按对齐的悬垂地址，释放无副作用。
-/// Test goal: A zero-sized allocation creates no page, returns an aligned dangling
+/// 测试目标：零尺寸分配不追加 Page，返回按对齐的悬垂地址，释放无副作用。
+/// Test goal: A zero-sized allocation appends no page, returns an aligned dangling
 /// pointer, and its deallocation is a no-op.
-/// - 手段 / Method: 用 1 KiB 页分配 `Layout::new::<()>()`，再释放。
-/// - 判定 / Assertion: 返回地址满足对齐；计数分配器没有申请/释放 Page。
+/// - 手段 / Method: 用 1 KiB 页构造 allocator（构造时申请 root 页），再分配
+///   `Layout::new::<()>()` 并释放。
+/// - 判定 / Assertion: 返回地址满足对齐；计数分配器的申请次数与构造后相同，
+///   没有额外的 Page 申请，也没有 Page 释放。
 #[test]
 fn zero_sized_allocation_does_not_create_page() {
     let (alloc, counters) = CountingAlloc::new();
     let bump = BumpListAlloc::new_in(alloc, PageSize::P1K).expect("1 KiB 页应当受支持");
+    let allocs_after_construction = counters.allocs();
     let alloc: &TestBump = &bump;
 
     let layout = Layout::new::<()>();
@@ -65,32 +68,35 @@ fn zero_sized_allocation_does_not_create_page() {
     // SAFETY: 该指针来自同一 allocator 与 layout 的零尺寸分配。
     unsafe { Allocator::deallocate(&alloc, ptr, layout) };
 
-    assert_eq!(counters.allocs(), 0);
+    assert_eq!(counters.allocs(), allocs_after_construction);
     assert_eq!(counters.deallocs(), 0);
     drop(bump);
+    assert_eq!(counters.allocs(), counters.deallocs());
 }
 
-/// 测试目标：固定页大小下，超过页可容纳空间的请求返回 `AllocError`，且不申请 Page。
-/// Test goal: With fixed page sizes, an oversized request returns `AllocError` and
-/// allocates no page.
+/// 测试目标：固定页大小下，超过页可容纳空间的请求返回 `AllocError`，且不追加 Page。
+/// Test goal: With fixed page sizes, an oversized request returns `AllocError` and appends
+/// no page.
 /// - 手段 / Method: 1 KiB 页上直接分配 8 KiB，并用 `Vec::try_reserve` 触发扩容失败。
-/// - 判定 / Assertion: 两次尝试都返回错误；计数分配器没有 Page 申请。
+/// - 判定 / Assertion: 两次尝试都返回错误；计数分配器的申请次数与构造后相同。
 #[test]
 fn fixed_page_size_limits_allocation() {
     let (alloc, counters) = CountingAlloc::new();
     let bump = BumpListAlloc::new_in(alloc, PageSize::P1K).expect("1 KiB 页应当受支持");
+    let allocs_after_construction = counters.allocs();
     let alloc: &TestBump = &bump;
 
     let layout = Layout::from_size_align(8 * 1024, 8).expect("布局合法");
     assert!(Allocator::allocate(&alloc, layout).is_err());
-    assert_eq!(counters.allocs(), 0);
+    assert_eq!(counters.allocs(), allocs_after_construction);
 
     let mut values: Vec<u8, &TestBump> = Vec::new_in(&bump);
     assert!(values.try_reserve(8 * 1024).is_err());
-    assert_eq!(counters.allocs(), 0);
+    assert_eq!(counters.allocs(), allocs_after_construction);
 
     drop(values);
     drop(bump);
+    assert_eq!(counters.allocs(), counters.deallocs());
 }
 
 /// 测试目标：同一 allocator 的所有 Page 都使用配置的页大小，页满后会继续开新页。

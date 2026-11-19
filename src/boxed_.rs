@@ -580,12 +580,12 @@ impl<'a, T: Clone> Clone for Box<'a, T> {
 
         let layout = Layout::new::<T>();
         // SAFETY: 当前句柄仍然拥有块，所以块所在 Page 有效；`'a` 借住 arena，
-        // 期间 arena 不会被移走或析构，Page 的 owner（Core）保持有效。
+        // 期间 arena 不会被析构，Page 的 owner（Core）保持有效。
         let (page, _) = unsafe { self.locate_page_() };
         // SAFETY: 同上。
         let core = unsafe { page.as_ref().owner_ptr_() };
-        // `self_ptr_` 已由创建本句柄的那次 `&BumpListAlloc` 分配刷新为当前 arena
-        // 地址；`'a` 期间 arena 不会移动。
+        // Core 位于 arena 第一页的堆内存中，地址不随 `BumpListAlloc` 句柄移动；
+        // `'a` 期间 arena 不会被析构，因此 Core 与其 backing 分配器一直有效。
         let block = match unsafe { core.as_ref() }.allocate_(layout) {
             Result::Ok(block) => block,
             Result::Err(_) => alloc::alloc::handle_alloc_error(layout),
