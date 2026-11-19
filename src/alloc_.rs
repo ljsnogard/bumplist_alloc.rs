@@ -14,24 +14,21 @@ use core::{
 use crate::{
     error_::BumpListAllocError,
     lock_::{SpinGuard, SpinLock},
-    page_::{ORDER_MASK, PTR, Page},
+    page_::{CellIndex, PTR, Page},
     page_size_::PageSize,
 };
 
 /// Page 链表的头尾；由 `BumpListAlloc::list_lock_` 保护。
-struct Inner {
+struct PageList {
     head_: Option<NonNull<Page>>,
     tail_: Option<NonNull<Page>>,
-    /// `tail_` 是否为空页；只在链表锁内读写。
-    tail_empty_: bool,
 }
 
-impl Inner {
+impl PageList {
     const fn empty_() -> Self {
         Self {
             head_: None,
             tail_: None,
-            tail_empty_: false,
         }
     }
 }
@@ -96,7 +93,7 @@ pub(crate) struct BumpListCore {
     ///
     /// `A: Send` 只保证 A 可以独占地在任意线程使用；并发调用仍需要本锁。
     backing_lock_: SpinLock,
-    inner_: UnsafeCell<Inner>,
+    inner_: UnsafeCell<PageList>,
     backing_alloc_: PageAllocFn,
     backing_dealloc_: PageDeallocFn,
     self_ptr_: AtomicPtr<()>,
@@ -118,7 +115,7 @@ impl BumpListCore {
             page_bytes_: page_size.bytes(),
             list_lock_: SpinLock::new(),
             backing_lock_: SpinLock::new(),
-            inner_: UnsafeCell::new(Inner::empty_()),
+            inner_: UnsafeCell::new(PageList::empty_()),
             backing_alloc_: alloc_page_::<A>,
             backing_dealloc_: dealloc_page_::<A>,
             self_ptr_: AtomicPtr::new(core::ptr::null_mut()),
@@ -159,7 +156,9 @@ impl BumpListCore {
         }?;
         // SAFETY: mem 是刚申请、至少 page_bytes 字节、按 Page 对齐的独占内存；
         // Page 头占用不超过 page_bytes。
-        Ok(unsafe { Page::init_in_place_(mem, NonNull::from(self)) })
+        Ok(unsafe {
+            Page::init_in_place_(mem, NonNull::from(self), Page::CELLS as CellIndex)
+        })
     }
 
     /// 归还一个已摘链、已 drain 的 Page。
@@ -181,7 +180,7 @@ impl BumpListCore {
     /// 把新页追加到 `tail` 之后，并更新 `head_` / `tail_`。
     ///
     /// 调用方必须持有链表锁。
-    fn link_after_(&self, inner: &mut Inner, tail: Option<NonNull<Page>>, page: NonNull<Page>) {
+    fn link_after_(&self, inner: &mut PageList, tail: Option<NonNull<Page>>, page: NonNull<Page>) {
         // SAFETY: 调用方持有链表锁；page 是新页，尚未共享。
         let page_ref = unsafe { page.as_ref() };
         unsafe {
@@ -199,7 +198,7 @@ impl BumpListCore {
     /// 把 Page 从链表摘下。
     ///
     /// 调用方必须持有链表锁，且 `page` 必须在链表上。
-    fn unlink_(&self, inner: &mut Inner, page: NonNull<Page>) {
+    fn unlink_(&self, inner: &mut PageList, page: NonNull<Page>) {
         // SAFETY: 调用方持有链表锁；page 在链表上。
         let page_ref = unsafe { page.as_ref() };
         // SAFETY: 链表锁保证 links_ 没有并发写。
@@ -224,19 +223,18 @@ impl BumpListCore {
     /// 在链表锁内创建新页、完成本次分配并挂到 `tail` 之后。
     fn create_page_and_alloc_locked_(
         &self,
-        inner: &mut Inner,
+        inner: &mut PageList,
         tail: Option<NonNull<Page>>,
         layout: Layout,
     ) -> Result<NonNull<u8>, AllocError> {
         let page = self.create_page_()?;
         // SAFETY: page 刚创建、尚未挂链，独占访问。
         let page_ref = unsafe { page.as_ref() };
-        let Some(ptr) = page_ref.try_alloc_(page, layout, self.page_cells_) else {
+        let Some(ptr) = page_ref.try_alloc_(page, layout) else {
             self.dealloc_page_(page);
             return Err(AllocError);
         };
         self.link_after_(inner, tail, page);
-        inner.tail_empty_ = false;
         Ok(ptr)
     }
 
@@ -271,10 +269,7 @@ impl BumpListCore {
         loop {
             let list_guard = self.lock_list_();
             // SAFETY: 持有链表锁。
-            let (tail, tail_was_empty) = unsafe {
-                let inner = &*self.inner_.get();
-                (inner.tail_, inner.tail_empty_)
-            };
+            let tail = unsafe { (*self.inner_.get()).tail_ };
             let Some(tail_page) = tail else {
                 // SAFETY: 持有链表锁。
                 let inner = unsafe { &mut *self.inner_.get() };
@@ -296,25 +291,13 @@ impl BumpListCore {
             // SAFETY: 持有页锁，页不会被摘链释放。
             let page_ref = unsafe { &*page_ptr };
             // SAFETY: 持有页锁。
-            if let Some(ptr) =
-                unsafe { page_ref.try_alloc_locked_(tail_page, layout, self.page_cells_) }
-            {
+            if let Some(ptr) = unsafe { page_ref.try_alloc_locked_(tail_page, layout) } {
                 drop(page_guard);
-                if tail_was_empty {
-                    // 空 tail 已被本次分配复用；在链表锁内清除标记。
-                    let list_guard = self.lock_list_();
-                    // SAFETY: 持有链表锁。
-                    let inner = unsafe { &mut *self.inner_.get() };
-                    if inner.tail_ == Some(tail_page) {
-                        inner.tail_empty_ = false;
-                    }
-                    drop(list_guard);
-                }
                 return Ok(Self::slice_(ptr, layout.size()));
             }
             // 空 tail 页放不下时，同大小的新页也不会容纳这个请求；保持空页复用，
             // 直接返回错误，避免把唯一空 tail 变成非 tail。
-            let was_empty = unsafe { page_ref.live_locked_() == 0 };
+            let was_empty = unsafe { page_ref.empty_locked_() };
             drop(page_guard);
             if was_empty {
                 return Err(AllocError);
@@ -346,45 +329,39 @@ impl BumpListCore {
             return;
         }
 
-        // SAFETY: 块仍然活跃；BlockHeader 紧邻用户块之前，且只读。
-        let header_addr = unsafe { ptr.as_ptr().sub(PTR) };
-        // SAFETY: 同上；BlockHeader 的首个 u16 是 order_flags。
-        let flags = unsafe { (header_addr as *const u16).read() };
-        let header_cell = flags & ORDER_MASK;
-        let order = header_cell as usize;
-        let Some(offset) = order.checked_mul(PTR) else {
-            return;
-        };
-        // SAFETY: BlockHeader 的 provenance 覆盖整页；减去 order * PTR 回到页首。
-        let page_addr = unsafe { header_addr.sub(offset) };
-        // SAFETY: Page 首地址非空且落在同一页分配内。
-        let page = unsafe { NonNull::new_unchecked(page_addr as *mut Page) };
+        // SAFETY: 块仍然活跃；由用户块首址反推 Page 与块头（含对齐 padding 的情况）。
+        let (page, header_cell) = unsafe { Page::locate_block_(ptr) };
         // `release_page_` 在页变空时会通过 Page 的 owner 指针把回收升级给本分配器。
         let _ = Page::release_page_(page, header_cell);
     }
 
     /// 回收一个刚变空的 Page。
     ///
-    /// 规则：只保留 `tail_` 这一个空页供复用；其它空页摘链并归还。函数持有页锁
-    /// 再去取链表锁，配合分配路径的 `try_lock` 回退，不会形成 ABBA 死锁。
+    /// 规则：只保留 `tail_` 这一个空页供复用；其它空页摘链并归还。是否为空由
+    /// `PageState.returned_ == used_` 判断，不再需要 `PageList` 里的 bool。
+    ///
+    /// 锁顺序为链表锁 → 页锁（可能再锁一次 tail 页）。分配路径只会在持有链表锁时
+    /// 用 `try_lock` 取页锁；归还路径在调用本函数前已经释放页锁，因此不会形成
+    /// ABBA 死锁。
     pub(crate) fn cleanup_empty_page_(&self, page: NonNull<Page>) {
+        let list_guard = self.lock_list_();
         // SAFETY: 调用方保证 page 仍然有效（活跃块刚刚归还或旧 tail）。
         let page_ref = unsafe { page.as_ref() };
         let page_guard = page_ref.lock_();
+        // 期间可能被 tail 分配复用，需要重新确认。
         // SAFETY: 持有页锁。
-        if unsafe { page_ref.live_locked_() } != 0 {
+        if unsafe { !page_ref.empty_locked_() } {
             drop(page_guard);
+            drop(list_guard);
             return;
         }
 
-        let list_guard = self.lock_list_();
         // SAFETY: 持有链表锁。
         let inner = unsafe { &mut *self.inner_.get() };
         if inner.tail_ == Some(page) {
             // 已经是 tail 空页：保留并复用，不归还。
-            inner.tail_empty_ = true;
-            drop(list_guard);
             drop(page_guard);
+            drop(list_guard);
             return;
         }
         // SAFETY: 链表锁保证 links_ 没有并发写。
@@ -392,24 +369,36 @@ impl BumpListCore {
             || unsafe { page_ref.prev_() }.is_some()
             || unsafe { page_ref.next_() }.is_some();
         if !linked {
-            drop(list_guard);
             drop(page_guard);
+            drop(list_guard);
             return;
         }
 
         self.unlink_(inner, page);
-        if inner.tail_empty_ {
+        // 检查原 tail 是否为空。链表锁保证 tail 不会被摘链/释放，页锁保证状态稳定。
+        let tail_is_empty = match inner.tail_ {
+            Some(tail) => {
+                // SAFETY: tail 仍在链表上，链表锁保证其存活。
+                let tail_ref = unsafe { tail.as_ref() };
+                let tail_guard = tail_ref.lock_();
+                // SAFETY: 持有 tail 的页锁。
+                let empty = unsafe { tail_ref.empty_locked_() };
+                drop(tail_guard);
+                empty
+            }
+            None => false,
+        };
+        if tail_is_empty {
             // 已经有一个空 tail 页；这个额外的空页归还。
-            drop(list_guard);
             drop(page_guard);
+            drop(list_guard);
             self.dealloc_page_(page);
         } else {
             // 还没有空页：把这个空页挪到 tail 保留复用，避免归还唯一空页。
             let old_tail = inner.tail_;
             self.link_after_(inner, old_tail, page);
-            inner.tail_empty_ = true;
-            drop(list_guard);
             drop(page_guard);
+            drop(list_guard);
         }
     }
 
@@ -474,7 +463,7 @@ pub struct BumpListAlloc<A: Allocator + Send = Global> {
     alloc_: A,
 }
 
-// SAFETY: `Inner` 与 Page 链表中的 `NonNull` 指针由 `list_lock_` 保护；Page 的
+// SAFETY: `PageList` 与 Page 链表中的 `NonNull` 指针由 `list_lock_` 保护；Page 的
 // `state_` 由页锁保护；Page 地址在分配后不再移动。`A` 的 `Send` 允许整个 allocator
 // 转移线程。
 unsafe impl<A: Allocator + Send> Send for BumpListAlloc<A> {}
@@ -565,7 +554,6 @@ impl Drop for BumpListCore {
             inner.tail_ = None;
             head
         };
-        let page_cells = self.page_cells_;
         let mut cursor = head;
         while let Some(page) = cursor {
             // SAFETY: Drop 独占 self；没有并发访问。
@@ -573,7 +561,7 @@ impl Drop for BumpListCore {
             // SAFETY: 同上；链表 links_ 没有并发写。
             let next = unsafe { page_ref.next_() };
 
-            let scan = page_ref.scan_chain_(page, page_cells);
+            let scan = page_ref.scan_chain_(page);
             #[cfg(any(test, feature = "std"))]
             {
                 match scan {
@@ -685,7 +673,7 @@ mod tests_ {
             // SAFETY: 单线程测试，Page 有效。
             let page_ref = unsafe { page.as_ref() };
             let (live, _freed) = page_ref
-                .scan_chain_(page, bump.core_.page_cells_)
+                .scan_chain_(page)
                 .expect("链应当有效");
             total = total.checked_add(live).expect("live 计数不溢出");
             // SAFETY: 单线程测试，链表有效。
@@ -695,15 +683,8 @@ mod tests_ {
     }
 
     fn page_of_block_(ptr: NonNull<u8>) -> NonNull<Page> {
-        // SAFETY: BlockHeader 紧邻用户块之前。
-        let header = unsafe { ptr.as_ptr().sub(PTR) };
-        // SAFETY: BlockHeader 至少包含首个 u16。
-        let flags = unsafe { (header as *const u16).read() };
-        let cell = (flags & ORDER_MASK) as usize;
-        // SAFETY: 减去自身 cell 下标回到页首。
-        let page = unsafe { header.sub(cell * PTR) };
-        // SAFETY: 页首非空。
-        unsafe { NonNull::new_unchecked(page as *mut Page) }
+        // SAFETY: 块仍然活跃，由 locator/块头反推页首。
+        unsafe { Page::locate_block_(ptr).0 }
     }
 
     fn block_ptr_(block: NonNull<[u8]>) -> NonNull<u8> {

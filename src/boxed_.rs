@@ -17,7 +17,7 @@ use core::{
 
 use abs_mm::res_man::{TrBoxed, TrUnique};
 
-use crate::page_::{ORDER_MASK, PTR, Page};
+use crate::page_::{CellIndex, Page};
 
 /// [`BumpListAlloc`](crate::BumpListAlloc) 的独占句柄。
 ///
@@ -315,14 +315,10 @@ impl<'a, T: ?Sized> Box<'a, T> {
     /// # Safety
     ///
     /// `ptr_` 必须指向一个仍然活跃、非零尺寸的 arena 块。
-    unsafe fn locate_page_(&self) -> (NonNull<Page>, u16) {
+    unsafe fn locate_page_(&self) -> (NonNull<Page>, CellIndex) {
+        // SAFETY: 句柄独占一个活跃块；`T: ?Sized` 时先丢弃元数据，只保留数据地址。
         unsafe {
-            // `T: ?Sized` 时先丢弃元数据，只保留数据地址。
-            let header_addr = (self.ptr_.as_ptr() as *const u8).sub(PTR);
-            let flags = (header_addr as *const u16).read();
-            let header_cell = flags & ORDER_MASK;
-            let page_addr = header_addr.sub(usize::from(header_cell) * PTR);
-            (NonNull::new_unchecked(page_addr as *mut Page), header_cell)
+            Page::locate_block_(NonNull::new_unchecked(self.ptr_.as_ptr() as *mut u8))
         }
     }
 }

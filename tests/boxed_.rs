@@ -508,3 +508,28 @@ fn send_not_sync_arena_() {
         });
     });
 }
+
+#[repr(align(64))]
+struct OverAligned(u8);
+
+/// 测试目标：高对齐类型在块头前存在 padding 时，`Box` 析构仍能找到块头并归还块。
+/// Test goal: when a highly aligned value leaves padding between the header and the user
+/// block, `Box::drop` still finds the header and releases the block.
+///
+/// - 手段：在 4 KiB 页 arena 中装箱一个 64 字节对齐的类型，读取字段后离开作用域。
+/// - 判定：字段值正确；析构后 arena 仍可继续分配，说明块已归还且页状态一致。
+///
+/// - Means: box a 64-byte-aligned type in a 4 KiB-page arena, read its field and leave
+///   scope.
+/// - Verdict: the field is correct and the arena can still allocate afterwards, proving
+///   the block was released and page state stayed consistent.
+#[test]
+fn over_aligned_box_drop_() {
+    let arena = BumpListAlloc::new(PageSize::P4K).expect("4 KiB 页应当受支持");
+    {
+        let boxed = in_arena_(&arena, OverAligned(7));
+        assert_eq!(boxed.0, 7);
+    }
+    let again = in_arena_(&arena, 9u32);
+    assert_eq!(*again, 9);
+}

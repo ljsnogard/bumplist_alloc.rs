@@ -11,7 +11,7 @@ use core::{
 
 /// 一把不可重入的自旋锁。
 ///
-/// 嵌入 `BumpListAlloc` 的 `Inner`，因此使用 `#[repr(C)]` 固定为 1 字节的
+/// 嵌入 `BumpListCore`，因此使用 `#[repr(C)]` 固定为 1 字节的
 /// `AtomicBool` 布局。
 #[repr(C)]
 #[derive(Debug)]

@@ -67,10 +67,9 @@ BumpListAlloc<A>
 │   ├── list_lock_               // 只保护 Page 链表
 │   ├── backing_alloc_ / backing_dealloc_  // 两个单态化函数指针
 │   ├── self_ptr_                // 整分配器地址；offset_of! 用它取 alloc_
-│   └── inner_
+│   └── inner_: PageList
 │       ├── head_ ──> Page A <──> Page B <──> Page C
-│       ├── tail_                     // 分配时优先尝试的页
-│       └── tail_empty_: bool         // tail_ 是否为空页
+│       └── tail_                     // 分配时优先尝试的页
 └── alloc_: A                    // 底层分配器；Core 用 offset_of! 反推它
 ```
 
@@ -80,26 +79,34 @@ BumpListAlloc<A>
 
 每个 Page 有：
 
-- 页首的 Page 头：链表指针、`used_` / `live_` / `first_` / `last_` 与 owner 指针
-  （最低位兼作页锁）；`Page` / `PageLinks` / `PageState` / `BlockHeader` / `SpinLock`
-  都是 `#[repr(C)]`，字段按大小手动编排；Page 头在 64 位下 32 字节、32 位下 20 字节；
+- 页首的 Page 头：链表指针、`base_` / `cells_` / `used_` / `returned_` 与 owner
+  指针（最低位兼作页锁）；`Page` / `PageLinks` / `PageState` / `BlockHeader` /
+  `SpinLock` 都是 `#[repr(C)]`，字段按大小手动编排；Page 头在 64 位下 32 字节、
+  32 位下 20 字节；
+- `PageState` 的 4 个 `u16`：`base_` 是首个可分配 cell 的页内绝对下标，`cells_` 是
+  从 `base_` 起可分配的 cell 数，`used_` 是相对 `base_` 的 bump 偏移，`returned_`
+  是相对 `base_` 的已归还 cell 数；`base_` / `cells_` 允许不同页不同；
 - 一个内嵌的块链：每个 `BlockHeader` 保存自身 cell 下标（低 15 位）、已释放标记
-  （最高位）与下一个块头的 cell 下标；
-- 页锁：owner 指针的最低位，保护本页的 bump 游标、活跃块计数与块链状态；owner 指向
-  非泛型的 `BumpListCore`，它至少按指针宽度对齐，最低位必然为 0，因此不需要额外的锁字段。
+  （最高位）与本块末尾（下一块头 / bump 末尾）的 cell 下标；有对齐 padding 时，
+  紧邻用户块之前的 cell 是 locator，记录到块头的距离；
+- 页锁：owner 指针的最低位，保护本页的 bump 游标、`PageState` 与块链状态；owner
+  指向非泛型的 `BumpListCore`，它至少按指针宽度对齐，最低位必然为 0，因此不需要额外
+  的锁字段。
 
-普通 `deallocate` 只需要页锁。`live_` 归零时，先把 `used_` / `first_` / `last_`
-重置，再通过 Page 的 owner 指针把清理升级给 `BumpListCore`：清理路径取页锁、
-`list_lock_`，把这个空页挪到 `tail_` 保留复用。如果已经有
-一个空 tail，则把多出来的空页摘链归还。因此 allocator 始终最多缓存一个空 Page，
-且它总是 `tail_`；不需要 `retiring` 标记，也不需要 drain。
+普通 `deallocate` 只需要页锁。`returned_ == used_` 表示整页已经全部归还；此时通过
+Page 的 owner 指针把清理升级给 `BumpListCore`：清理路径按「链表锁 → 页锁」取锁，
+把这个空页挪到 `tail_` 保留复用；如果已经有一个空 tail，则把多出来的空页摘链归还。
+因此 allocator 始终最多缓存一个空 Page，且它总是 `tail_`；`PageList` 不需要
+`tail_empty_` 标记，也不需要 `retiring` / drain。
 
 ## 页内块链与 debug
 
-`BlockHeader` 的 `next_free` 是页内块链的后继槽。分配时会把前一块头的后继回填到新
-块头，因此可以从 `PageState.first_` 扫描整页的块；释放块在页未空时只设置 `Free`
-标记，不改变链；页变空时 `used_` / `first_` / `last_` 一起重置，供下一次复用。这让
-Page 可以做内部一致性检查，也用于 `BumpListAlloc` 析构时检测未释放块。
+`BlockHeader` 的 `next_free` 是本块末尾（也就是下一块头的位置）。分配时块头放在当前
+bump 位置，`next_free = end`，因此块链天然连续，可以从 `PageState.base_` 一路走到
+`base_ + used_`，不需要 `first_` / `last_`。释放块只设置 `Free` 标记，并把
+`next_free - header_cell` 累加到 `returned_`；`returned_ == used_` 时把两者归零，
+供下一次复用。这既让 Page 可以做内部一致性检查，也用于 `BumpListAlloc` 析构时检测
+未释放块。
 
 默认构建是 `no_std`，不会打印警告；开启 `std` 特性后，析构时会扫描每个 Page 并把
 未释放块数量写到 stderr：

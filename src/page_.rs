@@ -5,20 +5,29 @@
 //! ```text
 //! Page base
 //! ├── Page { links, lock, state }
-//! ├── ... padding 到 cell 边界 ...
+//! ├── ... padding 到首个可分配 cell ...
 //! ├── BlockHeader cell (order_flags, next_free, reserved)
+//! ├── ... 对齐 padding ...
 //! ├── user block
 //! ├── ...
 //! ```
 //!
-//! Page 内以指针宽度 `P = size_of::<usize>()` 为一个 cell。`BlockHeader` 占一个
-//! cell；用户块从下一个 cell 开始。`BlockHeader.order_flags` 的低 15 位是自身 cell
-//! 下标，最高位表示该块已经释放；`BlockHeader.next_free` 是页内块链的后继 cell
-//! 下标（`u16::MAX` 表示没有后继）。
+//! Page 内以指针宽度 `P = size_of::<usize>()` 为一个 cell。`PageState.base_` 是首个
+//! 可分配 cell 的页内绝对下标（可以大于 `Page::CELLS`，页与页可以不同），`cells_`
+//! 是从 `base_` 起可用的 cell 数。`BlockHeader.order_flags` 的低 15 位是自身 cell
+//! 的页内绝对下标，最高位表示该块已经释放；`next_free` 是本块末尾（也就是下一块头）
+//! 的 cell 下标。最后一块的 `next_free` 等于 `base_ + used_`，因此扫描时不需要
+//! `first_` / `last_`，直接从 `base_` 沿链走到 `base_ + used_` 即可。
 //!
-//! 块链在分配时通过回填前一块头的 `next_free` 建立。释放块只设置 `FREE_BIT`，不改变
-//! 链，因此可以从 `PageState.first_` 走完整页的块链，统计存活/已释放块，供 debug 与
-//! `BumpListAlloc` 析构时检查未释放内存。
+//! 分配时块头放在当前 bump 位置，用户数据在块头之后按 `Layout::align()` 对齐；
+//! 块头与用户数据之间的 padding 属于本块。若 padding 存在，紧邻用户块之前的
+//! padding cell 会写入 locator（最高位置 [`LOCATOR_BIT`]，低 15 位是到块头的 cell
+//! 距离），这样 `Allocator::deallocate` / `Box::drop` 仍能从用户指针 O(1) 找到块头。
+//! 没有 padding 时，紧邻用户块的 cell 就是块头的 `order_flags`（最高位为 0）。
+//!
+//! 释放块只设置 `FREE_BIT`，并把本块的 cell 数累加到 `PageState.returned_`；当
+//! `returned_ == used_` 时整页已经全部归还。这同时支持不同页使用不同的
+//! `base_` / `cells_`。
 
 use core::{
     alloc::Layout,
@@ -31,17 +40,22 @@ use core::{
 
 use crate::{alloc_::BumpListCore, page_size_::MAX_PAGE_CELLS};
 
+pub(crate) type CellIndex = u16;
+
 /// 指针宽度，也是 Page 内一个 cell 的字节数。
 pub(crate) const PTR: usize = mem::size_of::<usize>();
 
-/// 没有后继/没有首块时使用的哨兵。
-pub(crate) const SENTINEL: u16 = u16::MAX;
-
 /// `order_flags` 的最高位：该块已释放。
-pub(crate) const FREE_BIT: u16 = 1 << 15;
+pub(crate) const FREE_BIT: CellIndex = 1 << 15;
 
 /// `order_flags` 中保存 cell 下标的低位掩码。
-pub(crate) const ORDER_MASK: u16 = FREE_BIT - 1;
+pub(crate) const ORDER_MASK: CellIndex = FREE_BIT - 1;
+
+/// 用户块前有对齐 padding 时，紧邻用户块的 locator cell 的最高位。
+///
+/// locator 的低 15 位保存“紧邻用户块的 cell 到块头的 cell 距离”。没有 padding 时
+/// 该 cell 就是活跃块头的 `order_flags`，最高位为 0，因此可以安全地区分。
+pub(crate) const LOCATOR_BIT: CellIndex = 1 << 15;
 
 /// 页内块头。
 ///
@@ -50,9 +64,9 @@ pub(crate) const ORDER_MASK: u16 = FREE_BIT - 1;
 #[repr(C)]
 pub(crate) struct BlockHeader {
     /// 低 15 位：自身 cell 下标；最高位：已释放标记。
-    pub(crate) order_flags_: u16,
-    /// 页内块链的后继 cell 下标；`SENTINEL` 表示没有后继。
-    pub(crate) next_free_: u16,
+    pub(crate) order_flags_: CellIndex,
+    /// 本块末尾（下一块头 / bump 末尾）的页内绝对 cell 下标。
+    pub(crate) next_free_: CellIndex,
     /// 保留字节，当前不读写。
     _reserved_: [u8; PTR - 4],
 }
@@ -69,16 +83,23 @@ pub(crate) struct PageLinks {
 /// Page 的可变状态；由本页的页锁保护。
 ///
 /// 四个字段都是 `u16`，`repr(C)` 下正好 8 字节，没有内部 padding。
+///
+/// - `base_` / `cells_` 是页的初始参数：首个可分配 cell 的页内绝对下标，以及从它
+///   开始可用的 cell 数；
+/// - `used_` 是相对 `base_` 的 bump 偏移（已消耗的 cell 数）；
+/// - `returned_` 是相对 `base_` 的已归还 cell 数。
+///
+/// 整页是否全部归还只需比较 `returned_ == used_`；空页复用后两者都归零。
 #[repr(C)]
 pub(crate) struct PageState {
-    /// 下一个可 bump 的 cell 下标；空页复用时会重置。
-    pub(crate) used_: u16,
-    /// 本页仍存活的块数。
-    pub(crate) live_: u16,
-    /// 本页第一个块头的 cell 下标；没有块时为 `SENTINEL`。
-    pub(crate) first_: u16,
-    /// 本页最后一个块头的 cell 下标；没有块时为 `SENTINEL`。
-    pub(crate) last_: u16,
+    /// 首个可分配 cell 的页内绝对下标。
+    pub(crate) base_: CellIndex,
+    /// 从 `base_` 起可分配的 cell 数。
+    pub(crate) cells_: CellIndex,
+    /// 相对 `base_` 的当前 bump 偏移。
+    pub(crate) used_: CellIndex,
+    /// 相对 `base_` 的已归还 cell 数。
+    pub(crate) returned_: CellIndex,
 }
 
 /// Page 头。
@@ -149,7 +170,23 @@ impl Page {
     pub(crate) unsafe fn init_in_place_(
         mem: NonNull<[u8]>,
         owner: NonNull<BumpListCore>,
+        first_cell: CellIndex,
     ) -> NonNull<Self> {
+        let page_cells = mem.len() / PTR;
+        let first = first_cell as usize;
+        assert!(
+            first >= Self::CELLS,
+            "first_cell must not overlap the Page header"
+        );
+        assert!(
+            first < page_cells,
+            "first_cell must leave at least one cell"
+        );
+        let cells = page_cells - first;
+        assert!(
+            cells <= MAX_PAGE_CELLS,
+            "allocatable cells exceed MAX_PAGE_CELLS"
+        );
         let base = mem.cast::<Self>();
         let owner_ptr = owner.as_ptr();
         debug_assert_eq!(
@@ -165,10 +202,10 @@ impl Page {
                     next_: None,
                 }),
                 state_: UnsafeCell::new(PageState {
-                    used_: Self::CELLS as u16,
-                    live_: 0,
-                    first_: SENTINEL,
-                    last_: SENTINEL,
+                    base_: first_cell,
+                    cells_: cells as CellIndex,
+                    used_: 0,
+                    returned_: 0,
                 }),
                 owner_: AtomicPtr::new(owner_ptr),
             });
@@ -260,33 +297,68 @@ impl Page {
         unsafe { (*self.links_.get()).next_ = next };
     }
 
-    /// 取得某个 cell 下标处的 BlockHeader 指针。
+    /// 取得某个页内绝对 cell 下标处的 BlockHeader 指针。
     ///
     /// # Safety
     ///
-    /// `page` 必须是有效的 Page 首指针；`cell` 必须小于 Page 的 cell 总数，且不等于
-    /// `SENTINEL`。
-    fn header_at_(page: NonNull<Page>, cell: u16) -> *mut BlockHeader {
+    /// `page` 必须是有效的 Page 首指针；`cell` 必须落在页内。
+    fn header_at_(page: NonNull<Page>, cell: CellIndex) -> *mut BlockHeader {
         let base = page.cast::<u8>().as_ptr();
         // SAFETY: 由调用方保证 cell 落在页内；page 指针带整页 provenance。
         unsafe { base.add(cell as usize * PTR).cast::<BlockHeader>() }
     }
 
+    /// 由用户块首址反推所属 Page 与块头 cell 下标。
+    ///
+    /// 若块头与用户块之间存在对齐 padding，紧邻用户块的 cell 是 locator（最高位
+    /// [`LOCATOR_BIT`]，低 15 位是到块头的 cell 距离）；否则该 cell 就是活跃块头的
+    /// `order_flags`（最高位为 0）。
+    ///
+    /// # Safety
+    ///
+    /// `ptr` 必须指向本页一个仍然活跃的块（块头尚未设置 `FREE_BIT`）。
+    pub(crate) unsafe fn locate_block_(ptr: NonNull<u8>) -> (NonNull<Page>, CellIndex) {
+        // SAFETY: 调用方保证 ptr 是有效用户块首址，其前一个 cell 可读。
+        let cell_addr = unsafe { ptr.as_ptr().sub(PTR) };
+        // SAFETY: 同上。
+        let tag = unsafe { (cell_addr as *const CellIndex).read() };
+        let header_addr = if tag & LOCATOR_BIT != 0 {
+            let distance = (tag & ORDER_MASK) as usize;
+            // SAFETY: locator 由本页分配时写入，distance 指向本块的块头。
+            unsafe { cell_addr.sub(distance * PTR) }
+        } else {
+            cell_addr
+        };
+        // SAFETY: header_addr 指向本块的块头。
+        let flags = unsafe { (header_addr as *const CellIndex).read() };
+        debug_assert_eq!(
+            flags & FREE_BIT,
+            0,
+            "locate_block_ must only be used on a live block"
+        );
+        let order = flags & ORDER_MASK;
+        // SAFETY: order 是块头自身的页内绝对 cell 下标。
+        let page_addr = unsafe { header_addr.sub(order as usize * PTR) };
+        // SAFETY: Page 首地址非空且落在同一页分配内。
+        (
+            unsafe { NonNull::new_unchecked(page_addr as *mut Page) },
+            order,
+        )
+    }
+
     /// 获取页锁后尝试在页内分配。
     ///
     /// 返回用户块首址；空间不足或尺寸为零时返回 [`None`]。
-    pub(crate) fn try_alloc_(
-        &self,
-        page: NonNull<Page>,
-        layout: Layout,
-        page_cells: u16,
-    ) -> Option<NonNull<u8>> {
+    pub(crate) fn try_alloc_(&self, page: NonNull<Page>, layout: Layout) -> Option<NonNull<u8>> {
         let _guard = self.lock_();
         // SAFETY: 当前线程持有页锁。
-        unsafe { self.try_alloc_locked_(page, layout, page_cells) }
+        unsafe { self.try_alloc_locked_(page, layout) }
     }
 
     /// 在已持有页锁的前提下尝试分配。
+    ///
+    /// 块头放在当前 bump 位置；用户数据在块头之后按 `Layout::align()` 对齐，块头与
+    /// 用户数据之间的 padding 属于本块。`next_free` 记录本块末尾（下一块头位置）。
     ///
     /// # Safety
     ///
@@ -295,7 +367,6 @@ impl Page {
         &self,
         page: NonNull<Page>,
         layout: Layout,
-        page_cells: u16,
     ) -> Option<NonNull<u8>> {
         if layout.size() == 0 {
             return None;
@@ -303,51 +374,62 @@ impl Page {
         // SAFETY: 调用方持有页锁，state_ 的访问是独占的。
         let state = unsafe { &mut *self.state_.get() };
 
+        let base_cell = state.base_ as usize;
+        let cells = state.cells_ as usize;
+        let used = state.used_ as usize;
+        if used >= cells {
+            return None;
+        }
+        let header_cell = base_cell.checked_add(used)?;
+        if header_cell >= MAX_PAGE_CELLS {
+            return None;
+        }
+
         let base_ptr = page.cast::<u8>().as_ptr();
         let base_addr = base_ptr as usize;
-        let used = state.used_ as usize;
-        let header_start = base_addr.checked_add(used.checked_add(1)?.checked_mul(PTR)?)?;
+        let header_start = base_addr.checked_add(header_cell.checked_add(1)?.checked_mul(PTR)?)?;
         let align = layout.align().max(PTR);
         let user_addr = align_up_(header_start, align)?;
         let user_off = user_addr.checked_sub(base_addr)?;
-        let header_off = user_off.checked_sub(PTR)?;
-        if !header_off.is_multiple_of(PTR) {
+        if !user_off.is_multiple_of(PTR) {
             return None;
         }
-        let header_cell = header_off / PTR;
-        if header_cell < used || header_cell >= MAX_PAGE_CELLS {
+        let user_cell = user_off / PTR;
+        if user_cell < header_cell + 1 {
             return None;
         }
 
         let data_cells = layout.size().div_ceil(PTR);
-        let end_cell = header_cell.checked_add(1)?.checked_add(data_cells)?;
-        if end_cell > page_cells as usize {
+        let end_cell = user_cell.checked_add(data_cells)?;
+        let page_end = base_cell.checked_add(cells)?;
+        if end_cell > page_end || end_cell > MAX_PAGE_CELLS {
             return None;
         }
 
-        // SAFETY: header_off 已校验落在 page_cells 范围内；从页首指针偏移保留页内
-        // provenance，且本线程持有页锁。
+        let header_off = header_cell.checked_mul(PTR)?;
+        // SAFETY: header_off 已校验落在页内；从页首指针偏移保留页内 provenance，且
+        // 本线程持有页锁。
         let header = unsafe { base_ptr.add(header_off).cast::<BlockHeader>() };
         // SAFETY: header 落在页内，且本线程持有页锁。
         unsafe {
-            (*header).order_flags_ = header_cell as u16;
-            (*header).next_free_ = SENTINEL;
+            (*header).order_flags_ = header_cell as CellIndex;
+            (*header).next_free_ = end_cell as CellIndex;
         }
 
-        // 回填前一个块头的后继；由此形成整页的块链。
-        if state.first_ == SENTINEL {
-            state.first_ = header_cell as u16;
-        } else {
-            if state.last_ == SENTINEL {
-                return None;
-            }
-            let last_header = Self::header_at_(page, state.last_);
-            // SAFETY: last_header 属于本页，且持有页锁。
-            unsafe { (*last_header).next_free_ = header_cell as u16 };
+        if user_cell > header_cell + 1 {
+            // 块头与用户块之间有 padding：在紧邻用户块的 cell 写入 locator，
+            // 供 deallocate 从用户指针反推块头。
+            let distance = (user_cell - 1 - header_cell) as CellIndex;
+            debug_assert!(distance < ORDER_MASK);
+            let locator_cell = user_cell.checked_sub(1)?;
+            let locator_off = locator_cell.checked_mul(PTR)?;
+            // SAFETY: locator_off 落在本块 padding 内，且持有页锁。
+            let locator = unsafe { base_ptr.add(locator_off).cast::<CellIndex>() };
+            // SAFETY: 同上。
+            unsafe { locator.write(LOCATOR_BIT | distance) };
         }
-        state.last_ = header_cell as u16;
-        state.used_ = end_cell as u16;
-        state.live_ = state.live_.checked_add(1)?;
+
+        state.used_ = (end_cell - base_cell) as CellIndex;
 
         // SAFETY: user_off 已校验落在页内，user_addr 非零；从页首偏移保留 provenance。
         Some(unsafe { NonNull::new_unchecked(base_ptr.add(user_off)) })
@@ -358,7 +440,7 @@ impl Page {
     /// 它是关联函数而不是 `&self` 方法：页刚变空时会经 owner 回调把「空页回收」升级给
     /// [`BumpListAlloc`]，清理可能释放 Page 本身。所有 `&Page` 借用都只活在取页锁 /
     /// 读取 owner 的短作用域内，调用清理前已经结束，避免在已释放页上保留引用。
-    pub(crate) fn release_page_(page: NonNull<Page>, header_cell: u16) -> bool {
+    pub(crate) fn release_page_(page: NonNull<Page>, header_cell: CellIndex) -> bool {
         let became_empty = {
             // SAFETY: `page` 是有效的 Page 首指针；页锁在释放块期间防止并发分配。
             let page_ref = unsafe { page.as_ref() };
@@ -383,102 +465,145 @@ impl Page {
 
     /// 在已持有页锁的前提下归还一个块；返回该页是否刚刚变为空页。
     ///
-    /// `header_cell` 是 BlockHeader 自身在页内的 cell 下标。函数会把块头的
-    /// `FREE_BIT` 置真；页变空时把 `used_` / `first_` / `last_` 重置，使这个 Page
-    /// 可以直接复用（不设退休状态）。
+    /// `header_cell` 是 BlockHeader 自身的页内绝对 cell 下标。函数会把块头的
+    /// `FREE_BIT` 置真，按 `next_free - header_cell` 把本块占用的 cell 数累加到
+    /// `returned_`；当 `returned_ == used_` 时把 `used_` / `returned_` 归零，使这个
+    /// Page 可以直接复用（不设退休状态）。重复释放或块头不一致时返回 `false`。
     ///
     /// # Safety
     ///
     /// 调用方必须持有本 Page 的页锁，且 `page` 是有效的 Page 首指针。
-    pub(crate) unsafe fn release_locked_(&self, page: NonNull<Page>, header_cell: u16) -> bool {
-        // SAFETY: 调用方持有页锁。
-        let state = unsafe { &mut *self.state_.get() };
-        let Some(live) = state.live_.checked_sub(1) else {
-            return false;
-        };
-        if header_cell >= MAX_PAGE_CELLS as u16 {
+    pub(crate) unsafe fn release_locked_(
+        &self,
+        page: NonNull<Page>,
+        header_cell: CellIndex,
+    ) -> bool {
+        if header_cell >= MAX_PAGE_CELLS as CellIndex {
             return false;
         }
-        state.live_ = live;
+        // SAFETY: 调用方持有页锁。
+        let state = unsafe { &mut *self.state_.get() };
+        let base = state.base_ as usize;
+        let end = base.saturating_add(state.used_ as usize);
         let header = Self::header_at_(page, header_cell);
+        // SAFETY: header_cell 已校验小于 MAX_PAGE_CELLS，且调用方持有页锁。
+        let flags = unsafe { (*header).order_flags_ };
+        if flags & ORDER_MASK != header_cell {
+            return false;
+        }
+        if flags & FREE_BIT != 0 {
+            return false;
+        }
+        // SAFETY: 同上。
+        let next = unsafe { (*header).next_free_ } as usize;
+        if (header_cell as usize) < base || next <= header_cell as usize || next > end {
+            return false;
+        }
+        let span = next - header_cell as usize;
+        let Some(returned) = state.returned_.checked_add(span as CellIndex) else {
+            return false;
+        };
+        if returned > state.used_ {
+            return false;
+        }
+
         // SAFETY: header_cell 落在页内，且持有页锁。
-        unsafe { (*header).order_flags_ |= FREE_BIT };
-        if live == 0 {
-            // 空页回到初始 bump 状态；若是唯一空页，BumpListAlloc 会把它留作 tail 复用。
-            state.used_ = Self::CELLS as u16;
-            state.first_ = SENTINEL;
-            state.last_ = SENTINEL;
+        unsafe { (*header).order_flags_ = flags | FREE_BIT };
+        state.returned_ = returned;
+        if returned == state.used_ {
+            // 整页已全部归还：回到初始 bump 状态，base_ / cells_ 保持不变。
+            state.used_ = 0;
+            state.returned_ = 0;
             true
         } else {
             false
         }
     }
 
-    /// 读取当前活跃块数。
+    /// 当前页是否已经全部归还（`returned_ == used_`）。
     ///
     /// # Safety
     ///
     /// 调用方必须持有本 Page 的页锁。
-    pub(crate) unsafe fn live_locked_(&self) -> u16 {
+    pub(crate) unsafe fn empty_locked_(&self) -> bool {
         // SAFETY: 由调用方保证页锁。
-        unsafe { (*self.state_.get()).live_ }
+        let state = unsafe { &*self.state_.get() };
+        state.returned_ == state.used_
     }
 
     /// 扫描整页块链，返回 `(live, freed)`。
     ///
-    /// 该函数持页锁，并验证链的 cell 范围、order 一致性、live 计数与首尾指针；用于
-    /// debug 与 `BumpListAlloc` 析构时的未释放内存警告。
+    /// 从 `base_` 开始，沿每个块头的 `next_free`（本块末尾 / 下一块头）走到
+    /// `base_ + used_`；同时校验链范围、order 一致性，以及已归还 cell 数是否等于
+    /// `state.returned_`。用于 debug 与 `BumpListAlloc` 析构时的未释放内存警告。
     ///
     /// # Errors
     ///
-    /// 链损坏、order 不一致、live 计数不匹配或首尾指针不一致时返回错误描述。
-    pub(crate) fn scan_chain_(
-        &self,
-        page: NonNull<Page>,
-        page_cells: u16,
-    ) -> Result<(u16, u16), &'static str> {
+    /// 链损坏、order 不一致、`next_free` 越界或已归还计数不匹配时返回错误描述。
+    pub(crate) fn scan_chain_(&self, page: NonNull<Page>) -> Result<(u16, u16), &'static str> {
         let _guard = self.lock_();
         // SAFETY: 持有页锁。
         let state = unsafe { &*self.state_.get() };
-        if page_cells > MAX_PAGE_CELLS as u16 {
-            return Err("page_cells exceeds MAX_PAGE_CELLS");
+        let base = state.base_ as usize;
+        let cells = state.cells_ as usize;
+        let used = state.used_ as usize;
+
+        let page_end = base.checked_add(cells).ok_or("page capacity overflow")?;
+        if page_end > MAX_PAGE_CELLS {
+            return Err("page capacity exceeds MAX_PAGE_CELLS");
+        }
+        if state.returned_ > state.used_ {
+            return Err("returned exceeds used");
+        }
+        if used == 0 {
+            if state.returned_ != 0 {
+                return Err("non-zero returned on empty page");
+            }
+            return Result::Ok((0, 0));
         }
 
-        let mut cell = state.first_;
+        let end = base.checked_add(used).ok_or("used overflow")?;
+        let mut cell = base;
         let mut live = 0u16;
         let mut freed = 0u16;
+        let mut freed_cells = 0usize;
         let mut steps = 0usize;
-        let mut last_seen = SENTINEL;
 
-        while cell != SENTINEL {
-            if cell >= page_cells {
+        while cell < end {
+            if cell >= MAX_PAGE_CELLS {
                 return Err("block cell out of range");
             }
-            if steps > page_cells as usize {
+            if steps > cells {
                 return Err("block chain cycle");
             }
             // SAFETY: cell 已校验落在页内。
-            let header = unsafe { &*Self::header_at_(page, cell) };
-            if header.order_flags_ & ORDER_MASK != cell {
+            let header = unsafe { &*Self::header_at_(page, cell as CellIndex) };
+            if header.order_flags_ & ORDER_MASK != cell as CellIndex {
                 return Err("block order mismatch");
+            }
+            let next = header.next_free_ as usize;
+            if next <= cell || next > end {
+                return Err("block next out of range");
             }
             if header.order_flags_ & FREE_BIT != 0 {
                 freed = freed.checked_add(1).ok_or("freed count overflow")?;
+                freed_cells = freed_cells
+                    .checked_add(next - cell)
+                    .ok_or("freed cell overflow")?;
             } else {
                 live = live.checked_add(1).ok_or("live count overflow")?;
             }
-            last_seen = cell;
-            cell = header.next_free_;
+            cell = next;
             steps += 1;
         }
 
-        if live != state.live_ {
-            return Err("live count mismatch");
+        if cell != end {
+            return Err("block chain end mismatch");
         }
-        if last_seen != state.last_ {
-            return Err("last block mismatch");
+        if freed_cells != state.returned_ as usize {
+            return Err("returned count mismatch");
         }
-        Ok((live, freed))
+        Result::Ok((live, freed))
     }
 }
 
@@ -504,13 +629,18 @@ mod tests_ {
     struct TestPage {
         page: NonNull<Page>,
         layout: Layout,
-        page_cells: u16,
+        first_cell: CellIndex,
+        capacity: u16,
         // owner 的堆地址在 TestPage 生命周期内保持稳定；Drop 时重建 Box 释放。
         bump_ptr_: NonNull<crate::BumpListAlloc>,
     }
 
     impl TestPage {
         fn new_(bytes: usize) -> Self {
+            Self::new_with_base_(bytes, Page::CELLS as CellIndex)
+        }
+
+        fn new_with_base_(bytes: usize, first_cell: CellIndex) -> Self {
             let layout =
                 Layout::from_size_align(bytes, mem::align_of::<Page>()).expect("测试页布局合法");
             // SAFETY: 测试中直接申请一块独立内存。
@@ -527,11 +657,12 @@ mod tests_ {
             // 地址不随外层 BumpListAlloc 移动。
             let core_ptr_ = unsafe { NonNull::from(&bump_ptr_.as_ref().core_) };
             // SAFETY: 内存足够、按 Page 对齐且独占；owner 在 TestPage 生命周期内稳定。
-            let page = unsafe { Page::init_in_place_(mem, core_ptr_) };
+            let page = unsafe { Page::init_in_place_(mem, core_ptr_, first_cell) };
             Self {
                 page,
                 layout,
-                page_cells: (bytes / PTR) as u16,
+                first_cell,
+                capacity: (bytes / PTR) as u16 - first_cell,
                 bump_ptr_,
             }
         }
@@ -551,24 +682,14 @@ mod tests_ {
         }
     }
 
-    fn header_cell_(ptr: NonNull<u8>) -> u16 {
-        // SAFETY: 指针来自本测试页的分配，BlockHeader 紧邻用户块之前。
-        let header = unsafe { ptr.as_ptr().sub(PTR) };
-        // SAFETY: BlockHeader 至少包含首个 u16。
-        let flags = unsafe { (header as *const u16).read() };
-        flags & ORDER_MASK
+    fn header_cell_(ptr: NonNull<u8>) -> CellIndex {
+        // SAFETY: 指针来自本测试页的活跃块。
+        unsafe { Page::locate_block_(ptr).1 }
     }
 
     fn page_of_block_(ptr: NonNull<u8>) -> NonNull<Page> {
-        // SAFETY: 同 header_cell_。
-        let header = unsafe { ptr.as_ptr().sub(PTR) };
-        // SAFETY: 同 header_cell_。
-        let flags = unsafe { (header as *const u16).read() };
-        let cell = (flags & ORDER_MASK) as usize;
-        // SAFETY: 减去自身位置下标回到页首，仍在同一页分配内。
-        let page = unsafe { header.sub(cell * PTR) };
-        // SAFETY: 页首非空。
-        unsafe { NonNull::new_unchecked(page as *mut Page) }
+        // SAFETY: 指针来自本测试页的活跃块。
+        unsafe { Page::locate_block_(ptr).0 }
     }
 
     /// 测试目标：页内块链能正确记录三个块的存活/释放状态，并能由块头反查页首。
@@ -582,58 +703,36 @@ mod tests_ {
     fn block_chain_tracks_live_and_freed_blocks() {
         let page = TestPage::new_(4096);
         let page_ref = page.page_ref_();
-        let page_cells = page.page_cells;
 
         let layout_a = Layout::from_size_align(8, 8).expect("布局合法");
         let layout_b = Layout::from_size_align(24, 8).expect("布局合法");
         let layout_c = Layout::from_size_align(16, 8).expect("布局合法");
 
-        let a = page_ref
-            .try_alloc_(page.page, layout_a, page_cells)
-            .expect("a");
-        let b = page_ref
-            .try_alloc_(page.page, layout_b, page_cells)
-            .expect("b");
-        let c = page_ref
-            .try_alloc_(page.page, layout_c, page_cells)
-            .expect("c");
+        let a = page_ref.try_alloc_(page.page, layout_a).expect("a");
+        let b = page_ref.try_alloc_(page.page, layout_b).expect("b");
+        let c = page_ref.try_alloc_(page.page, layout_c).expect("c");
         let (cell_a, cell_b, cell_c) = (header_cell_(a), header_cell_(b), header_cell_(c));
 
         assert_eq!(page_of_block_(a), page.page);
         assert_eq!(page_of_block_(b), page.page);
         assert_eq!(page_of_block_(c), page.page);
-        assert_eq!(
-            page_ref.scan_chain_(page.page, page_cells).expect("链有效"),
-            (3, 0)
-        );
+        assert_eq!(page_ref.scan_chain_(page.page).expect("链有效"), (3, 0));
 
         assert!(!Page::release_page_(page.page, cell_a));
-        assert_eq!(
-            page_ref.scan_chain_(page.page, page_cells).expect("链有效"),
-            (2, 1)
-        );
+        assert_eq!(page_ref.scan_chain_(page.page).expect("链有效"), (2, 1));
 
         assert!(!Page::release_page_(page.page, cell_b));
-        assert_eq!(
-            page_ref.scan_chain_(page.page, page_cells).expect("链有效"),
-            (1, 2)
-        );
+        assert_eq!(page_ref.scan_chain_(page.page).expect("链有效"), (1, 2));
 
         assert!(Page::release_page_(page.page, cell_c));
         // 最后一个块释放后 Page 回到初始 bump 状态，旧块链被清空。
-        assert_eq!(
-            page_ref.scan_chain_(page.page, page_cells).expect("链有效"),
-            (0, 0)
-        );
+        assert_eq!(page_ref.scan_chain_(page.page).expect("链有效"), (0, 0));
 
         // 空页可以立即复用，不需要先归还。
         let d = page_ref
-            .try_alloc_(page.page, layout_a, page_cells)
+            .try_alloc_(page.page, layout_a)
             .expect("空页应当可复用");
-        assert_eq!(
-            page_ref.scan_chain_(page.page, page_cells).expect("链有效"),
-            (1, 0)
-        );
+        assert_eq!(page_ref.scan_chain_(page.page).expect("链有效"), (1, 0));
         assert_eq!(page_of_block_(d), page.page);
     }
 
@@ -647,22 +746,19 @@ mod tests_ {
     fn allocation_alignment_is_respected() {
         let page = TestPage::new_(8192);
         let page_ref = page.page_ref_();
-        let page_cells = page.page_cells;
         let aligns = [1usize, 2, 4, 8, 16, 64, 4096];
         let mut cells = Vec::new();
 
         for align in aligns {
             let layout = Layout::from_size_align(1, align).expect("布局合法");
-            let ptr = page_ref
-                .try_alloc_(page.page, layout, page_cells)
-                .expect("应当放得下");
+            let ptr = page_ref.try_alloc_(page.page, layout).expect("应当放得下");
             assert_eq!(ptr.as_ptr() as usize % align, 0);
             assert_eq!(ptr.as_ptr() as usize % PTR, 0);
             cells.push(header_cell_(ptr));
         }
 
         assert_eq!(
-            page_ref.scan_chain_(page.page, page_cells).expect("链有效"),
+            page_ref.scan_chain_(page.page).expect("链有效"),
             (aligns.len() as u16, 0)
         );
 
@@ -670,10 +766,7 @@ mod tests_ {
             let empty = Page::release_page_(page.page, *cell);
             assert_eq!(empty, index + 1 == cells.len());
         }
-        assert_eq!(
-            page_ref.scan_chain_(page.page, page_cells).expect("链有效"),
-            (0, 0)
-        );
+        assert_eq!(page_ref.scan_chain_(page.page).expect("链有效"), (0, 0));
     }
 
     /// 测试目标：释放中间块后再分配，块链仍能覆盖新旧块并统计正确的存活/释放数量。
@@ -685,44 +778,26 @@ mod tests_ {
     fn chain_survives_free_then_allocate() {
         let page = TestPage::new_(4096);
         let page_ref = page.page_ref_();
-        let page_cells = page.page_cells;
         let layout = Layout::from_size_align(8, 8).expect("布局合法");
 
-        let a = page_ref
-            .try_alloc_(page.page, layout, page_cells)
-            .expect("a");
-        let b = page_ref
-            .try_alloc_(page.page, layout, page_cells)
-            .expect("b");
-        let c = page_ref
-            .try_alloc_(page.page, layout, page_cells)
-            .expect("c");
+        let a = page_ref.try_alloc_(page.page, layout).expect("a");
+        let b = page_ref.try_alloc_(page.page, layout).expect("b");
+        let c = page_ref.try_alloc_(page.page, layout).expect("c");
         let cell_a = header_cell_(a);
         let cell_b = header_cell_(b);
         let cell_c = header_cell_(c);
 
         assert!(!Page::release_page_(page.page, cell_b));
-        assert_eq!(
-            page_ref.scan_chain_(page.page, page_cells).expect("链有效"),
-            (2, 1)
-        );
+        assert_eq!(page_ref.scan_chain_(page.page).expect("链有效"), (2, 1));
 
-        let d = page_ref
-            .try_alloc_(page.page, layout, page_cells)
-            .expect("d");
+        let d = page_ref.try_alloc_(page.page, layout).expect("d");
         assert_eq!(page_of_block_(d), page.page);
-        assert_eq!(
-            page_ref.scan_chain_(page.page, page_cells).expect("链有效"),
-            (3, 1)
-        );
+        assert_eq!(page_ref.scan_chain_(page.page).expect("链有效"), (3, 1));
 
         assert!(!Page::release_page_(page.page, cell_a));
         assert!(!Page::release_page_(page.page, cell_c));
         assert!(Page::release_page_(page.page, header_cell_(d)));
-        assert_eq!(
-            page_ref.scan_chain_(page.page, page_cells).expect("链有效"),
-            (0, 0)
-        );
+        assert_eq!(page_ref.scan_chain_(page.page).expect("链有效"), (0, 0));
     }
 
     /// 测试目标：1 KiB 页填满时不会越界，order 与 used 都保持在页内，链扫描仍有效。
@@ -735,30 +810,23 @@ mod tests_ {
     fn full_page_boundary_is_safe() {
         let page = TestPage::new_(1024);
         let page_ref = page.page_ref_();
-        let page_cells = page.page_cells;
         let layout = Layout::from_size_align(8, 8).expect("布局合法");
         let mut cells = Vec::new();
 
-        while let Some(ptr) = page_ref.try_alloc_(page.page, layout, page_cells) {
+        while let Some(ptr) = page_ref.try_alloc_(page.page, layout) {
             cells.push(header_cell_(ptr));
-            assert!(cells.len() <= page_cells as usize);
+            assert!(cells.len() <= page.capacity as usize);
         }
 
         let live = cells.len() as u16;
         assert!(live > 0);
-        assert_eq!(
-            page_ref.scan_chain_(page.page, page_cells).expect("链有效"),
-            (live, 0)
-        );
+        assert_eq!(page_ref.scan_chain_(page.page).expect("链有效"), (live, 0));
 
         for (index, cell) in cells.iter().enumerate() {
             let empty = Page::release_page_(page.page, *cell);
             assert_eq!(empty, index + 1 == cells.len());
         }
-        assert_eq!(
-            page_ref.scan_chain_(page.page, page_cells).expect("链有效"),
-            (0, 0)
-        );
+        assert_eq!(page_ref.scan_chain_(page.page).expect("链有效"), (0, 0));
     }
 
     /// 测试目标：零尺寸请求不会在页内分配，也不会改变块链。
@@ -772,9 +840,180 @@ mod tests_ {
         let page_ref = page.page_ref_();
         assert!(
             page_ref
-                .try_alloc_(page.page, Layout::new::<()>(), page.page_cells)
+                .try_alloc_(page.page, Layout::new::<()>())
                 .is_none()
         );
+    }
+
+    /// 测试目标：`PageState.base_` / `cells_` 可以按页不同，容量随首个可分配 cell
+    /// 后移而缩小，且整页仍然按 `returned_ == used_` 判定为空。
+    /// Test goal: `PageState.base_` / `cells_` are per-page; moving the first allocatable
+    /// cell later reduces capacity, and emptiness is still derived from `returned_ ==
+    /// used_`.
+    ///
+    /// - 手段：用比 `Page::CELLS` 大 10 个 cell 的 `first_cell` 构造 1 KiB 测试页，
+    ///   分配 8 字节块直到放不下，记录首块块头与扫描结果，再全部释放。
+    /// - 判定：首块块头正好在 `first_cell`；容量等于总 cell 数减 `first_cell`；释放
+    ///   完毕后 `used_` / `returned_` 归零、`empty_locked_` 为真、链扫描为 (0,0)。
+    ///
+    /// - Means: build a 1 KiB test page with `first_cell = Page::CELLS + 10`, allocate
+    ///   8-byte blocks until full, check the first header and the scan, then release all.
+    /// - Verdict: the first header is exactly at `first_cell`; capacity is total cells
+    ///   minus `first_cell`; after releasing everything `used_` / `returned_` are zero,
+    ///   `empty_locked_` is true and the chain scans as (0, 0).
+    #[test]
+    fn variable_first_cell_reduces_capacity_() {
+        let first_cell = (Page::CELLS + 10) as CellIndex;
+        let page = TestPage::new_with_base_(1024, first_cell);
+        let page_ref = page.page_ref_();
+        assert_eq!(page.first_cell, first_cell);
+        assert_eq!(
+            page.capacity,
+            (page.layout.size() / PTR) as u16 - first_cell
+        );
+
+        let layout = Layout::from_size_align(8, 8).expect("布局合法");
+        let first = page_ref
+            .try_alloc_(page.page, layout)
+            .expect("首个块应当放得下");
+        assert_eq!(header_cell_(first), first_cell);
+        assert_eq!(page_of_block_(first), page.page);
+
+        let mut ptrs = Vec::new();
+        ptrs.push(first);
+        while let Some(ptr) = page_ref.try_alloc_(page.page, layout) {
+            ptrs.push(ptr);
+            assert!(ptrs.len() <= page.capacity as usize);
+        }
+        assert_eq!(
+            page_ref.scan_chain_(page.page).expect("链有效"),
+            (ptrs.len() as u16, 0)
+        );
+
+        let state = unsafe { &*page_ref.state_.get() };
+        assert_eq!((state.base_, state.cells_), (first_cell, page.capacity));
+        assert_eq!(state.returned_, 0);
+        assert!(!unsafe { page_ref.empty_locked_() });
+
+        for (index, ptr) in ptrs.iter().enumerate() {
+            let cell = header_cell_(*ptr);
+            let empty = Page::release_page_(page.page, cell);
+            assert_eq!(empty, index + 1 == ptrs.len());
+        }
+        let state = unsafe { &*page_ref.state_.get() };
+        assert_eq!((state.used_, state.returned_), (0, 0));
+        assert!(unsafe { page_ref.empty_locked_() });
+        assert_eq!(page_ref.scan_chain_(page.page).expect("链有效"), (0, 0));
+    }
+
+    /// 测试目标：对齐 padding 存在时，用户块前的 locator 能 O(1) 找回块头。
+    /// Test goal: when alignment padding exists, the locator immediately before the
+    /// user block recovers the header in O(1).
+    ///
+    /// - 手段：在 4 KiB 页上分配一个 64 字节对齐的 1 字节块，读取紧邻用户块之前的
+    ///   cell 与 `locate_block_` 的结果。
+    /// - 判定：locator 最高位为 1，距离与用户 cell/块头 cell 一致；`header_cell_` /
+    ///   `page_of_block_` 都能正确反推；释放后页变空。
+    ///
+    /// - Means: allocate a 64-byte-aligned 1-byte block on a 4 KiB page and inspect the
+    ///   cell immediately before the user block plus `locate_block_`.
+    /// - Verdict: the locator tag bit is set and its distance matches the user/header
+    ///   cells; `header_cell_` / `page_of_block_` recover correctly; releasing empties the
+    ///   page.
+    #[test]
+    fn locator_recovers_header_with_alignment_padding_() {
+        // 找一个让首个块头不落在 64 字节边界的 base，强制产生对齐 padding。
+        let mut first_cell = Page::CELLS as CellIndex;
+        let page = loop {
+            let page = TestPage::new_with_base_(4096, first_cell);
+            let header_start = page.page.as_ptr() as usize + (first_cell as usize + 1) * PTR;
+            if header_start % 64 != 0 {
+                break page;
+            }
+            first_cell += 1;
+            assert!(first_cell < 1024, "测试页容量不足以找到非对齐块头");
+        };
+        let page_ref = page.page_ref_();
+        let layout = Layout::from_size_align(1, 64).expect("布局合法");
+        let ptr = page_ref.try_alloc_(page.page, layout).expect("应当放得下");
+        assert_eq!(ptr.as_ptr() as usize % 64, 0);
+
+        let header_cell = header_cell_(ptr);
+        assert_eq!(header_cell, page.first_cell);
+        assert_eq!(page_of_block_(ptr), page.page);
+
+        // SAFETY: 用户块前面的 cell 可读。
+        let locator = unsafe { (ptr.as_ptr().sub(PTR) as *const CellIndex).read() };
+        assert_ne!(locator & LOCATOR_BIT, 0);
+        let user_cell = (ptr.as_ptr() as usize - page.page.as_ptr() as usize) / PTR;
+        let distance = locator & ORDER_MASK;
+        assert_eq!(header_cell as usize + distance as usize, user_cell - 1);
+
+        assert!(Page::release_page_(page.page, header_cell));
+    }
+
+    /// 测试目标：重复释放同一个块会被忽略，不破坏 `used_` / `returned_` 计数。
+    /// Test goal: releasing the same block twice is ignored and does not corrupt the
+    /// `used_` / `returned_` counters.
+    ///
+    /// - 手段：分配一个 8 字节块，连续调用两次 `Page::release_page_`。
+    /// - 判定：第一次返回 true（页变空），第二次返回 false；页状态回到 (0,0)，
+    ///   链扫描为 (0,0)。
+    ///
+    /// - Means: allocate an 8-byte block and call `Page::release_page_` twice.
+    /// - Verdict: the first call returns true, the second false; page state is (0,0) and
+    ///   the chain scans as (0,0).
+    #[test]
+    fn double_release_is_ignored_() {
+        let page = TestPage::new_(1024);
+        let page_ref = page.page_ref_();
+        let layout = Layout::from_size_align(8, 8).expect("布局合法");
+        let ptr = page_ref.try_alloc_(page.page, layout).expect("应当放得下");
+        let cell = header_cell_(ptr);
+
+        assert!(Page::release_page_(page.page, cell));
+        assert!(!Page::release_page_(page.page, cell));
+        let state = unsafe { &*page_ref.state_.get() };
+        assert_eq!((state.used_, state.returned_), (0, 0));
+        assert!(unsafe { page_ref.empty_locked_() });
+        assert_eq!(page_ref.scan_chain_(page.page).expect("链有效"), (0, 0));
+    }
+
+    /// 测试目标：`returned_` 随释放 cell 数增长，`returned_ == used_` 时才判定为空页。
+    /// Test goal: `returned_` grows with released cells and the page is empty only when
+    /// `returned_ == used_`.
+    ///
+    /// - 手段：分配两个 8 字节块，先释放第一个，再释放第二个。
+    /// - 判定：释放第一个后 `returned_ > 0` 且小于 `used_`，`empty_locked_` 为假；
+    ///   释放第二个后两者归零，`empty_locked_` 为真。
+    ///
+    /// - Means: allocate two 8-byte blocks and release them one by one.
+    /// - Verdict: after the first release `returned_ > 0` but `< used_` and the page is
+    ///   not empty; after the second both are zero and the page is empty.
+    #[test]
+    fn returned_count_derives_empty_() {
+        let page = TestPage::new_(1024);
+        let page_ref = page.page_ref_();
+        let layout = Layout::from_size_align(8, 8).expect("布局合法");
+        let a = page_ref.try_alloc_(page.page, layout).expect("a");
+        let b = page_ref.try_alloc_(page.page, layout).expect("b");
+        let (cell_a, cell_b) = (header_cell_(a), header_cell_(b));
+
+        let state = unsafe { &*page_ref.state_.get() };
+        assert!(state.used_ > 0);
+        assert_eq!(state.returned_, 0);
+        assert!(!unsafe { page_ref.empty_locked_() });
+
+        assert!(!Page::release_page_(page.page, cell_a));
+        let state = unsafe { &*page_ref.state_.get() };
+        assert!(state.returned_ > 0);
+        assert!(state.returned_ < state.used_);
+        assert!(!unsafe { page_ref.empty_locked_() });
+
+        assert!(Page::release_page_(page.page, cell_b));
+        let state = unsafe { &*page_ref.state_.get() };
+        assert_eq!((state.used_, state.returned_), (0, 0));
+        assert!(unsafe { page_ref.empty_locked_() });
     }
 
     /// 测试目标：BlockHeader 与 Page 头的静态尺寸约定成立。
@@ -786,7 +1025,7 @@ mod tests_ {
     fn layout_constants_are_consistent() {
         assert_eq!(mem::size_of::<BlockHeader>(), PTR);
         assert_eq!(Page::CELLS, mem::size_of::<Page>().div_ceil(PTR));
-        assert_eq!(SENTINEL, u16::MAX);
+        assert_eq!(mem::size_of::<PageState>(), 8);
         assert_eq!(ORDER_MASK, 0x7FFF);
         assert_eq!(FREE_BIT, 0x8000);
     }
