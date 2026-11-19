@@ -73,3 +73,11 @@ pub use boxed_::Box;
 pub use denco_arena_::BumpListArenaError;
 pub use error_::BumpListAllocError;
 pub use page_size_::{MAX_PAGE_BYTES, MAX_PAGE_CELLS, PageSize};
+
+/// 导出依赖的 crate
+pub mod x_deps {
+    pub use abs_mm;
+
+    #[cfg(feature = "denco_arena")]
+    pub use abs_denco;
+}
