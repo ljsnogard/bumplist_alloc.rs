@@ -244,6 +244,7 @@ impl BumpListCore {
     /// 分配路径的 `tail_` 永远不会指向大页，空页缓存策略也看不到大页。块释放后由
     /// [`BumpListCore::cleanup_empty_big_page_`] 立即摘链归还 backing。
     #[cfg(feature = "big_page")]
+    #[cold]
     fn allocate_big_(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         let geometry = BigGeometry::new_(layout).ok_or(AllocError)?;
         let raw = {
@@ -285,6 +286,7 @@ impl BumpListCore {
     ///
     /// 大页不参与“最多缓存一个空页”的策略：它的尺寸差异大，缓存会长期占住大块内存。
     #[cfg(feature = "big_page")]
+    #[cold]
     fn cleanup_empty_big_page_(&self, page: NonNull<Page>) {
         let list_guard = self.lock_list_();
         // SAFETY: 调用方保证 page 仍然有效（大页的块刚刚归还）。
@@ -312,6 +314,7 @@ impl BumpListCore {
 
     /// 归还一个已摘链的大页。
     #[cfg(feature = "big_page")]
+    #[cold]
     fn dealloc_big_page_(&self, page: NonNull<Page>) {
         // SAFETY: page 是已摘链、仍然存活的大页；dealloc_parts_ 只读取页头字段。
         let (raw, layout) = unsafe { BigPage::dealloc_parts_(page) };

@@ -335,6 +335,7 @@ impl Page {
     ///
     /// kind 在 `Page` 初始化后不再变化，因此不需要页锁。
     #[cfg(feature = "big_page")]
+    #[inline]
     pub(crate) fn is_large_(&self) -> bool {
         self.owner_.load(Ordering::Acquire).addr() & LARGE_BIT != 0
     }
