@@ -156,8 +156,10 @@ impl BumpListCore {
     /// 归还一个已摘链、已 drain 的 Page。
     fn dealloc_page_(&self, page: NonNull<Page>) {
         // SAFETY: page 由 create_page_ 以同一布局申请，且调用方保证已摘链、无页锁持有者。
-        let layout =
-            unsafe { Layout::from_size_align_unchecked(self.page_bytes_, mem::align_of::<Page>()) };
+        let layout = unsafe { Layout::from_size_align_unchecked(
+                self.page_bytes_,
+                mem::align_of::<Page>(),
+        ) };
         let base = self.self_ptr_();
         // SAFETY: 同上；page/layout 来自本分配器，A 先于 Core 存续。
         unsafe { (self.backing_dealloc_)(base, page.cast::<u8>(), layout) };

@@ -58,6 +58,7 @@ extern crate std;
 
 mod alloc_;
 mod alloc_ref_;
+mod boxed_;
 #[cfg(feature = "denco_arena")]
 mod denco_arena_;
 mod error_;
@@ -67,7 +68,8 @@ mod page_size_;
 
 pub use alloc_::BumpListAlloc;
 pub use alloc_ref_::BumpListAllocRef;
+pub use boxed_::Box;
 #[cfg(feature = "denco_arena")]
-pub use denco_arena_::{BumpListArenaError, BumpListBox};
+pub use denco_arena_::BumpListArenaError;
 pub use error_::BumpListAllocError;
 pub use page_size_::{MAX_PAGE_BYTES, MAX_PAGE_CELLS, PageSize};
