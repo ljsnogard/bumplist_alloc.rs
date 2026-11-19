@@ -3,8 +3,8 @@
 //! 本模块把 [`BumpListAlloc`](crate::BumpListAlloc) 实现成
 //! [`TrArena`](abs_denco::de::TrArena) 与 [`TrArenaBytes`](abs_denco::de::TrArenaBytes)：
 //!
-//! - `Ref<T>` 是 [`BumpListBox`]：一个拥有 `T` 的特制 Box，析构时运行 `T` 的析构函数，
-//!   并通过块头反推 `Page`、调用 [`Page::release_`] 把块归还到页内（空页会重置为可复用
+//! - `Ref<T>` 是 [`Box`](crate::Box)：一个拥有 `T` 的特制 Box，析构时运行 `T` 的析构函数，
+//!   并通过块头反推 `Page`、调用 `Page::release_` 把块归还到页内（空页会重置为可复用
 //!   状态）；页链表的摘链 / 底层归还仍由 [`BumpListAlloc`] 的回收路径负责；
 //! - 分配走本 crate 已有的 [`Allocator`](core::alloc::Allocator) 实现（只对
 //!   `&BumpListAlloc` 实现）；
@@ -16,29 +16,20 @@
 //! # `denco_arena_`: the `abs_denco` arena adapter
 //!
 //! Behind the `denco_arena` feature, `BumpListAlloc` implements `TrArena` / `TrArenaBytes`.
-//! `TrArena::Ref<T>` is a `BumpListBox` that runs `T`'s destructor and returns the block to
-//! its `Page` via `Page::release_` on drop.
+//! `TrArena::Ref<T>` is a [`Box`](crate::Box) that runs `T`'s destructor and returns the
+//! block to its `Page` via `Page::release_` on drop.
 
 use core::{
     alloc::{Allocator, Layout},
     error::Error,
     fmt, future,
-    marker::PhantomData,
-    mem,
-    ops::{Deref, DerefMut},
-    ptr::{self, NonNull},
+    ptr::NonNull,
     slice,
 };
 
-use abs_denco::{
-    TrBoxed, TrUnique,
-    de::{TrArena, TrArenaBytes},
-};
+use abs_denco::de::{TrArena, TrArenaBytes};
 
-use crate::{
-    BumpListAlloc,
-    page_::{ORDER_MASK, PTR, Page},
-};
+use crate::{Box, BumpListAlloc};
 
 /// `TrArena` 分配失败。
 ///
@@ -61,10 +52,10 @@ where
 {
     type Error = BumpListArenaError;
 
-    type Ref<T: 'alloc> = BumpListBox<'alloc, T> where Self: 'alloc;
+    type Ref<T: 'alloc> = Box<'alloc, T> where Self: 'alloc;
 
     type AllocValueAsync<'a, T> =
-        future::Ready<Result<BumpListBox<'alloc, T>, BumpListArenaError>>
+        future::Ready<Result<Box<'alloc, T>, BumpListArenaError>>
     where
         'alloc: 'a,
         T: 'alloc + 'a,
@@ -84,11 +75,11 @@ where
             Result::Ok(block) => {
                 let ptr = block.as_ptr().cast::<T>();
                 // SAFETY: `allocate` 返回一个按 `layout` 对齐、大小至少 `size_of::<T>()`
-                // 的未初始化块；这里写入一次，之后由 `BumpListBox` 独占，析构时运行
+                // 的未初始化块；这里写入一次，之后由 `Box` 独占，析构时运行
                 // `T` 的析构并归还块。
                 unsafe {
                     ptr.write(value);
-                    Result::Ok(BumpListBox::from_raw_(NonNull::new_unchecked(ptr)))
+                    Result::Ok(Box::from_raw_(NonNull::new_unchecked(ptr)))
                 }
             }
             Result::Err(_) => Result::Err(BumpListArenaError),

@@ -1,14 +1,10 @@
 use core::{
-    alloc::Allocator,
-    marker::PhantomData,
-    mem,
-    ops::{Deref, DerefMut},
-    ptr::{self, NonNull},
+    alloc::{Allocator, Layout}, marker::PhantomData, mem, ops::{Deref, DerefMut}, ptr::{self, NonNull},
 };
 
-use abs_mm::res_man::{TrAllocBy, TrBoxed, TrUnique};
+use abs_mm::res_man::{TrBoxed, TrUnique};
 
-use crate::page_::{ORDER_MASK, PTR, Page};
+use crate::{BumpListAlloc, page_::{ORDER_MASK, PTR, Page}};
 
 /// [`BumpListAlloc`] 的独占句柄，作为 [`TrArena::Ref`]。
 ///
@@ -29,6 +25,7 @@ pub struct Box<'a, T> {
 
 impl<'a, T> Box<'a, T> {
     /// 从 arena 分配出的裸指针接管所有权。
+    #[cfg(feature = "denco_arena")]
     pub(crate) fn from_raw_(raw: NonNull<T>) -> Self {
         Box {
             ptr_: raw,
@@ -60,18 +57,6 @@ impl<T> DerefMut for Box<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
         // SAFETY: `ptr_` 指向一块已写入、由本句柄独占的 `T`。
         unsafe { self.ptr_.as_mut() }
-    }
-}
-
-impl<'a, T> TrAllocBy for Box<'a, T> {
-    type Alloc = &'a dyn Allocator;
-
-    fn mem_alloc(&self) -> &Self::Alloc {
-        unsafe {
-            let (page, _) = self.locate_page_();
-            let page = page.as_ref();
-            todo!()
-        }
     }
 }
 
