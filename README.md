@@ -51,7 +51,8 @@ assert_eq!(&copy[..], &[1, 2, 3, 4]);
 
 ## 固定页大小
 
-同一个 `BumpListAlloc` 实例的所有 Page 大小相同，页大小来自有限枚举：
+同一个 `BumpListAlloc` 实例的所有**普通 Page** 大小相同，页大小来自有限枚举；
+开启 `big_page` 时，超页请求使用独立的大页，其大小由请求的 `Layout` 决定：
 
 | 选项 | 字节数 |
 | --- | ---: |
@@ -72,9 +73,14 @@ assert_eq!(&copy[..], &[1, 2, 3, 4]);
 - 32 位平台上限 128 KiB，`PageSize::P256K` 会返回
   `BumpListAllocError::UnsupportedPageSize`。
 
-一个分配块必须完整落在一个 Page 内。**超过页可容纳空间的请求返回 `AllocError`**，
-不会跨页，也不会临时申请大页。这适合小对象池；`Vec` / `String` 等容器在增长到超过
-页容量时通常会走 `handle_alloc_error`，请选择足够大的页或只用小块。
+未开启 `big_page` 特性时，一个分配块必须完整落在一个 Page 内，**超过页可容纳空间的
+请求返回 `AllocError`**。开启 `big_page` 后，超页请求由独立的 `BigPageList` 承接：
+每次分配一个只放一个块的专用 Page，块头仍位于页内很小的 cell 下标，释放后整页立即
+摘链并归还给底层分配器。大页与小页使用两条互不相邻的链表，普通页的分配、释放与
+“最多保留一个空页”的策略不受影响。
+
+默认构建适合小对象池；`Vec` / `String` 等容器在增长到超过页容量时，开启 `big_page`
+可以继续扩容，关闭时会走 `handle_alloc_error`，此时请选择足够大的页或只用小块。
 
 空 `tail_` 页若因对齐要求放不下某个请求，会直接返回 `AllocError`，不会为它追加
 同大小的新页。第一页因为要容纳 `InitPage<A>` 而容量更小；如果请求只是超过第一页的
@@ -91,9 +97,10 @@ BumpListAlloc<A>                 // 只有一个指针（#[repr(transparent)]）
     │   ├── root_page_           // 第一页；永不归还
     │   ├── backing_: NonNull<dyn Allocator>  // 指向下面的 A
     │   ├── state_: AtomicUsize  // 低位引用计数；最高两位是 list/backing lock
-    │   └── inner_: PageList
-    │       ├── head_ ──> Page A <──> Page B <──> Page C
-    │       └── tail_                     // 分配时优先尝试的页
+    │   ├── inner_: PageList
+    │   │   ├── head_ ──> Page A <──> Page B <──> Page C
+    │   │   └── tail_                     // 分配时优先尝试的页
+    │   └── big_: BigPageList             // 仅 big_page 特性；与 inner_ 分离
     ├── MaybeUninit<A>           // 底层分配器
     └── ... 用户可分配区域 ...
 
@@ -124,12 +131,17 @@ backing lock 串行化所有对 `A` 的 allocate / deallocate 调用。`CoreStat
   紧邻用户块之前的 cell 是 locator，记录到块头的距离；
 - 页锁：owner 指针的最低位，保护本页的 bump 游标、`PageState` 与块链状态；owner
   指向非泛型的 `BumpListCore`，它至少按指针宽度对齐，最低位必然为 0，因此不需要额外
-  的锁字段。
+  的锁字段；开启 `big_page` 时次低位另外标记“这是一张大页”。
 
 普通 `deallocate` 只需要页锁。`returned_ == used_` 表示整页已经全部归还；此时通过
 Page 的 owner 指针把清理升级给 `BumpListCore`：清理路径按「链表锁 → 页锁」取锁。
 第一页永远保留；普通空页遵循“最多保留一个空页”的策略，root 页为空时会把多余的空页
 归还。`PageList` 不需要 `tail_empty_` 标记，也不需要 `retiring` / drain。
+
+大页是“只放一个块”的专用 Page：`PageState` 为 `base_ = h`、`cells_ = 1`、
+`used_ ∈ {0, 1}`，块头紧贴用户块，因此小块那套 `locate_block_` / `release_locked_`
+仍可直接使用。大页挂在独立的 `BigPageList` 上，永不成为普通分配的 `tail_`；块释放
+后整页立即摘链并按 `BigPage` 里记录的原始布局归还给底层分配器，不进入空页缓存。
 
 第一页的构造与析构是自引用的关键：构造时先申请 `page_size` 字节、按
 `align_of::<InitPage<A>>()` 对齐的内存，再原地写 Page、A、Core；析构时先归还所有普通
@@ -156,13 +168,16 @@ cargo test --features std
 
 - 标准 `core::alloc::Allocator`：`BumpListAlloc` 与 `&BumpListAlloc` 都可用；句柄是
   单指针、可移动的，并实现引用计数式 `Clone` 与 `AllocatorClone`；
+- `big_page`：开启后支持超过普通页容量的单次分配；大页使用独立的 `BigPageList`，
+  释放后立即归还 backing，普通页热路径与空页策略不变。关闭时保持旧行为；
 - `denco_arena`：额外实现 `abs_denco::de::TrArena` / `TrArenaBytes`，让
   `MpDecoder::new_in` 可以把字符串 / 字节切片分配进同一个分配器；`TrArena::Ref<T>` 是
   `Box`，析构时运行 `T` 的析构函数并调用 `Page::release_page_` 把块归还到页内；
 - `Clone` 只增加第一页 Core 里的引用计数，不复制 arena；`Arc` / `Rc` 仍可用于外部共享；
 - 默认 `A = Global`；`A: Send` 时 `BumpListAlloc` 是 `Send + Sync`（`A` 的访问由
   backing lock 串行化，不要求 `A: Sync`）；
-- 所有 Page 同大小；第一页永久保留，此外最多保留一个空 Page，其余空页归还；
+- 所有普通 Page 同大小；第一页永久保留，此外最多保留一个空 Page，其余空页归还；
+  大页（`big_page`）使用独立链表，释放后立即归还，不参与空页缓存；
 - 构造时立即申请第一页，因此 `new` / `new_in` 可能因页大小或底层分配失败而返回错误；
 - `no_std`，无外部依赖；锁为自旋锁。
 
@@ -170,10 +185,18 @@ cargo test --features std
 
 ```bash
 cargo test
-cargo test --features std
+cargo test --features big_page
+cargo test --all-features
 cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --check
 python3 ../format_use_imports.py --check src tests
+```
+
+小页分配 / 回收的微基准（对比 `big_page` 开关）：
+
+```bash
+cargo bench --bench small_alloc
+cargo bench --features big_page --bench small_alloc
 ```
 
 在 Miri 下（含 `-Zmiri-strict-provenance`）：

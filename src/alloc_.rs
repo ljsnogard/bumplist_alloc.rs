@@ -11,6 +11,8 @@ use core::{
     ptr::NonNull,
 };
 
+#[cfg(feature = "big_page")]
+use crate::big_page_::{BigGeometry, BigPage};
 use crate::{
     error_::BumpListAllocError,
     init_page_::InitPage,
@@ -25,7 +27,22 @@ struct PageList {
     tail_: Option<NonNull<Page>>,
 }
 
+/// 大页链表；与普通页的 [`PageList`] 完全分离，但共用同一把 list lock。
+///
+/// 复用 `PageList` 的双向链接结构，因此 `link_after_` / `unlink_` 对两条链表都适用。
+#[cfg(feature = "big_page")]
+type BigPageList = PageList;
+
 impl PageList {
+    /// 空链表；`big_page` 特性用它初始化独立的大页链表。
+    #[cfg(feature = "big_page")]
+    const fn empty_() -> Self {
+        Self {
+            head_: None,
+            tail_: None,
+        }
+    }
+
     const fn with_root_(root: NonNull<Page>) -> Self {
         Self {
             head_: Some(root),
@@ -52,6 +69,9 @@ pub(crate) struct BumpListCore {
     /// 被移出而失效。
     backing_: NonNull<dyn Allocator>,
     inner_: UnsafeCell<PageList>,
+    /// 大页链表；与 `inner_` 完全分离，和保护 `inner_` 的 list lock 共用同一把锁。
+    #[cfg(feature = "big_page")]
+    big_: UnsafeCell<BigPageList>,
     /// 低位引用计数；最高两位分别是 list / backing lock 标记。
     state_: CoreState,
     page_size_: PageSize,
@@ -71,6 +91,8 @@ impl BumpListCore {
             root_page_: root_page,
             backing_: backing,
             inner_: UnsafeCell::new(PageList::with_root_(root_page)),
+            #[cfg(feature = "big_page")]
+            big_: UnsafeCell::new(PageList::empty_()),
             state_: CoreState::new(),
             page_size_: page_size,
         }
@@ -216,6 +238,92 @@ impl BumpListCore {
         layout.size().div_ceil(PTR) <= max_data
     }
 
+    /// 大页分配：超页请求独立申请一块 backing 内存并构造单块 Page。
+    ///
+    /// 大页挂在独立的 `big_` 链表尾部，与普通页的 `inner_` 链表完全分离；因此普通页
+    /// 分配路径的 `tail_` 永远不会指向大页，空页缓存策略也看不到大页。块释放后由
+    /// [`BumpListCore::cleanup_empty_big_page_`] 立即摘链归还 backing。
+    #[cfg(feature = "big_page")]
+    #[cold]
+    fn allocate_big_(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        let geometry = BigGeometry::new_(layout).ok_or(AllocError)?;
+        let raw = {
+            let _guard = self.lock_backing_();
+            // SAFETY: backing 在第一页构造后一直指向仍然存活的 A；backing lock
+            // 串行化所有对 A 的调用，因此 A 只需要 `Send`。
+            unsafe { self.backing_.as_ref() }.allocate(geometry.alloc_layout_())?
+        };
+        let raw = raw.cast::<u8>();
+        // SAFETY: raw 来自 geometry.alloc_layout_ 的申请，仍然独占；几何已校验。
+        let Some((base, user)) = (unsafe { geometry.place_(raw) }) else {
+            // 理论上不可达；仍然按失败路径归还 raw，避免泄漏。
+            let _guard = self.lock_backing_();
+            // SAFETY: raw / layout 与上面的申请完全一致，且只归还一次。
+            unsafe {
+                self.backing_
+                    .as_ref()
+                    .deallocate(raw, geometry.alloc_layout_())
+            };
+            return Err(AllocError);
+        };
+        // SAFETY: base/user/raw 来自同一几何；core 位于第一页，地址在 arena 生命周期内
+        // 稳定；初始化发生在挂链之前，没有并发访问。
+        let page = unsafe { BigPage::init_(base, raw, &geometry, NonNull::from(self)) };
+
+        let list_guard = self.lock_list_();
+        // SAFETY: 持有链表锁；big_ 只由本锁保护。
+        unsafe {
+            let big = &mut *self.big_.get();
+            let tail = big.tail_;
+            self.link_after_(big, tail, page);
+        }
+        drop(list_guard);
+
+        Ok(Self::slice_(user, layout.size()))
+    }
+
+    /// 回收一个刚变空的大页：确认空页后从 `big_` 链表摘除并立即归还 backing。
+    ///
+    /// 大页不参与“最多缓存一个空页”的策略：它的尺寸差异大，缓存会长期占住大块内存。
+    #[cfg(feature = "big_page")]
+    #[cold]
+    fn cleanup_empty_big_page_(&self, page: NonNull<Page>) {
+        let list_guard = self.lock_list_();
+        // SAFETY: 调用方保证 page 仍然有效（大页的块刚刚归还）。
+        let page_ref = unsafe { page.as_ref() };
+        let page_guard = page_ref.lock_();
+        // SAFETY: 持有页锁；大页不在 inner_ 链表中，不会被普通分配复用。
+        if unsafe { !page_ref.empty_locked_() } {
+            drop(page_guard);
+            drop(list_guard);
+            return;
+        }
+        // SAFETY: 持有链表锁；大页在 big_ 链表上。
+        unsafe {
+            let big = &mut *self.big_.get();
+            debug_assert!(
+                big.head_ == Some(page) || page_ref.prev_().is_some() || page_ref.next_().is_some(),
+                "the big page must be linked before cleanup"
+            );
+            self.unlink_(big, page);
+        }
+        drop(page_guard);
+        drop(list_guard);
+        self.dealloc_big_page_(page);
+    }
+
+    /// 归还一个已摘链的大页。
+    #[cfg(feature = "big_page")]
+    #[cold]
+    fn dealloc_big_page_(&self, page: NonNull<Page>) {
+        // SAFETY: page 是已摘链、仍然存活的大页；dealloc_parts_ 只读取页头字段。
+        let (raw, layout) = unsafe { BigPage::dealloc_parts_(page) };
+        // SAFETY: raw/layout 来自本分配器的 backing，且只归还一次；backing lock
+        // 串行化所有对 A 的调用。
+        let _guard = self.lock_backing_();
+        unsafe { self.backing_.as_ref().deallocate(raw, layout) };
+    }
+
     /// 零尺寸分配：不创建 Page，返回按对齐的悬垂地址。
     fn zero_sized_(align: usize) -> Result<NonNull<[u8]>, AllocError> {
         let Some(align) = NonZero::new(align) else {
@@ -235,6 +343,9 @@ impl BumpListCore {
             return Self::zero_sized_(layout.align());
         }
         if !self.fits_page_(layout) {
+            #[cfg(feature = "big_page")]
+            return self.allocate_big_(layout);
+            #[cfg(not(feature = "big_page"))]
             return Err(AllocError);
         }
 
@@ -316,6 +427,9 @@ impl BumpListCore {
 
     /// 回收一个刚变空的 Page。
     ///
+    /// 开启 `big_page` 时，大页在入口处分流到
+    /// [`BumpListCore::cleanup_empty_big_page_`]；以下规则只适用于第一页与普通页。
+    ///
     /// 规则：第一页（root）永远保留；除此之外最多保留一个空页。是否为空由
     /// `PageState.returned_ == used_` 判断。
     ///
@@ -328,6 +442,11 @@ impl BumpListCore {
     /// 链表锁时用 `try_lock` 取页锁；归还路径在调用本函数前已经释放页锁，因此不会形成
     /// ABBA 死锁。未挂链的 Page（例如单元测试自己构造的 Page）不会被回收。
     pub(crate) fn cleanup_empty_page_(&self, page: NonNull<Page>) {
+        #[cfg(feature = "big_page")]
+        if unsafe { page.as_ref() }.is_large_() {
+            self.cleanup_empty_big_page_(page);
+            return;
+        }
         let list_guard = self.lock_list_();
         // SAFETY: 调用方保证 page 仍然有效（活跃块刚刚归还或旧 tail）。
         let page_ref = unsafe { page.as_ref() };
@@ -438,10 +557,10 @@ impl BumpListCore {
         }
     }
 
-    /// 析构第一步：归还所有普通页，保留 root 页。
+    /// 析构第一步：归还所有普通页与大页，保留 root 页。
     ///
     /// 只由 [`InitPage::drop_in_place_`] 在独占访问时调用。调用前后 A 必须仍然有效；
-    /// 这里通过 `backing_` 归还普通页，root 页则留给调用方在移出 A 后归还。
+    /// 这里通过 `backing_` 归还普通页与大页，root 页则留给调用方在移出 A 后归还。
     pub(crate) fn free_non_root_pages_(&mut self, root: NonNull<Page>) {
         debug_assert_eq!(root, self.root_page_, "root page mismatch");
         let head = {
@@ -478,6 +597,43 @@ impl BumpListCore {
                 self.dealloc_page_(page);
             }
             cursor = next;
+        }
+
+        // 大页在独立链表里，与 root 无关；析构时逐个归还它们自己的 backing 布局。
+        #[cfg(feature = "big_page")]
+        {
+            let head = {
+                let big = self.big_.get_mut();
+                let head = big.head_.take();
+                big.tail_ = Option::None;
+                head
+            };
+            let mut cursor = head;
+            while let Some(page) = cursor {
+                // 先取出 next 与扫描结果，再释放 page.as_ref() 的借用，最后才归还 page。
+                let (next, scan) = {
+                    // SAFETY: 大页在 big_ 链表上且尚未归还；独占析构期间没有并发访问。
+                    let page_ref = unsafe { page.as_ref() };
+                    // SAFETY: 同上。
+                    let next = unsafe { page_ref.next_() };
+                    (next, page_ref.scan_chain_(page))
+                };
+                #[cfg(any(test, feature = "std"))]
+                {
+                    match scan {
+                        Ok((live, _freed)) if live > 0 => Self::warn_live_blocks_(live),
+                        Ok(_) => {}
+                        Err(reason) => Self::warn_chain_corrupt_(reason),
+                    }
+                }
+                #[cfg(not(any(test, feature = "std")))]
+                {
+                    let _ = scan;
+                }
+
+                self.dealloc_big_page_(page);
+                cursor = next;
+            }
         }
 
         // root 的 links 还指向已经归还的页；清空它们，避免留下悬垂指针。
@@ -903,11 +1059,12 @@ mod tests_ {
         assert_eq!(count_pages_(&bump), 1);
     }
 
-    /// 测试目标：超过页容量的请求直接返回 `AllocError`，不追加 Page。
-    /// Test goal: A request larger than the page returns `AllocError` without appending a
-    /// page.
+    /// 测试目标：未开启 `big_page` 时，超过页容量的请求直接返回 `AllocError`，不追加 Page。
+    /// Test goal: Without `big_page`, a request larger than the page returns `AllocError`
+    /// without appending a page.
     /// - 手段 / Method: 1 KiB 页上请求 8 KiB。
     /// - 判定 / Assertion: `allocate_` 返回错误，页数仍为构造时的 1。
+    #[cfg(not(feature = "big_page"))]
     #[test]
     fn oversized_request_is_rejected_without_page() {
         let bump = BumpListAlloc::new(PageSize::P1K).expect("1 KiB 页");
