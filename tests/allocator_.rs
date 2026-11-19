@@ -46,15 +46,18 @@ fn vec_and_box_share_borrowed_allocator() {
     );
 }
 
-/// 测试目标：零尺寸分配不创建 Page，返回按对齐的悬垂地址，释放无副作用。
-/// Test goal: A zero-sized allocation creates no page, returns an aligned dangling
+/// 测试目标：零尺寸分配不追加 Page，返回按对齐的悬垂地址，释放无副作用。
+/// Test goal: A zero-sized allocation appends no page, returns an aligned dangling
 /// pointer, and its deallocation is a no-op.
-/// - 手段 / Method: 用 1 KiB 页分配 `Layout::new::<()>()`，再释放。
-/// - 判定 / Assertion: 返回地址满足对齐；计数分配器没有申请/释放 Page。
+/// - 手段 / Method: 用 1 KiB 页构造 allocator（构造时申请 root 页），再分配
+///   `Layout::new::<()>()` 并释放。
+/// - 判定 / Assertion: 返回地址满足对齐；计数分配器的申请次数与构造后相同，
+///   没有额外的 Page 申请，也没有 Page 释放。
 #[test]
 fn zero_sized_allocation_does_not_create_page() {
     let (alloc, counters) = CountingAlloc::new();
     let bump = BumpListAlloc::new_in(alloc, PageSize::P1K).expect("1 KiB 页应当受支持");
+    let allocs_after_construction = counters.allocs();
     let alloc: &TestBump = &bump;
 
     let layout = Layout::new::<()>();
@@ -65,32 +68,35 @@ fn zero_sized_allocation_does_not_create_page() {
     // SAFETY: 该指针来自同一 allocator 与 layout 的零尺寸分配。
     unsafe { Allocator::deallocate(&alloc, ptr, layout) };
 
-    assert_eq!(counters.allocs(), 0);
+    assert_eq!(counters.allocs(), allocs_after_construction);
     assert_eq!(counters.deallocs(), 0);
     drop(bump);
+    assert_eq!(counters.allocs(), counters.deallocs());
 }
 
-/// 测试目标：固定页大小下，超过页可容纳空间的请求返回 `AllocError`，且不申请 Page。
-/// Test goal: With fixed page sizes, an oversized request returns `AllocError` and
-/// allocates no page.
+/// 测试目标：固定页大小下，超过页可容纳空间的请求返回 `AllocError`，且不追加 Page。
+/// Test goal: With fixed page sizes, an oversized request returns `AllocError` and appends
+/// no page.
 /// - 手段 / Method: 1 KiB 页上直接分配 8 KiB，并用 `Vec::try_reserve` 触发扩容失败。
-/// - 判定 / Assertion: 两次尝试都返回错误；计数分配器没有 Page 申请。
+/// - 判定 / Assertion: 两次尝试都返回错误；计数分配器的申请次数与构造后相同。
 #[test]
 fn fixed_page_size_limits_allocation() {
     let (alloc, counters) = CountingAlloc::new();
     let bump = BumpListAlloc::new_in(alloc, PageSize::P1K).expect("1 KiB 页应当受支持");
+    let allocs_after_construction = counters.allocs();
     let alloc: &TestBump = &bump;
 
     let layout = Layout::from_size_align(8 * 1024, 8).expect("布局合法");
     assert!(Allocator::allocate(&alloc, layout).is_err());
-    assert_eq!(counters.allocs(), 0);
+    assert_eq!(counters.allocs(), allocs_after_construction);
 
     let mut values: Vec<u8, &TestBump> = Vec::new_in(&bump);
     assert!(values.try_reserve(8 * 1024).is_err());
-    assert_eq!(counters.allocs(), 0);
+    assert_eq!(counters.allocs(), allocs_after_construction);
 
     drop(values);
     drop(bump);
+    assert_eq!(counters.allocs(), counters.deallocs());
 }
 
 /// 测试目标：同一 allocator 的所有 Page 都使用配置的页大小，页满后会继续开新页。
@@ -153,6 +159,65 @@ fn drop_releases_live_pages() {
 
     assert_eq!(counters.allocs(), 1);
     assert_eq!(counters.deallocs(), 1);
+}
+
+/// 测试目标：`BumpListAlloc::clone` 只增加引用计数，不申请新 Page，且 clone 可以释放
+/// 原句柄分配的块。
+/// Test goal: `BumpListAlloc::clone` only bumps the reference count and allocates no page;
+/// a clone can release a block allocated through the original handle.
+/// - 手段 / Method: 构造 4 KiB 页 arena，clone 一次后用 clone 分配 64 字节块，再用原句柄
+///   释放；先 drop clone，再 drop 原句柄。
+/// - 判定 / Assertion: clone 后 Page 申请次数仍为 1；drop clone 时第一页不归还；最后一个
+///   句柄 drop 后申请与释放次数配平。
+#[test]
+fn cloned_handles_share_arena() {
+    let (alloc, counters) = CountingAlloc::new();
+    let bump = BumpListAlloc::new_in(alloc, PageSize::P4K).expect("4 KiB 页应当受支持");
+    assert_eq!(counters.allocs(), 1);
+
+    let clone = bump.clone();
+    assert_eq!(counters.allocs(), 1, "Clone 不应申请新的 Page");
+
+    let layout = Layout::from_size_align(64, 8).expect("布局合法");
+    let block = {
+        let alloc: &TestBump = &clone;
+        Allocator::allocate(&alloc, layout).expect("分配成功")
+    };
+    {
+        let alloc: &TestBump = &bump;
+        // SAFETY: 块来自同一个共享 arena 与 layout。
+        unsafe { Allocator::deallocate(&alloc, block.cast(), layout) };
+    }
+
+    drop(clone);
+    assert_eq!(counters.deallocs(), 0, "还有句柄存活时不能归还第一页");
+    drop(bump);
+    assert_eq!(counters.allocs(), counters.deallocs());
+}
+
+/// 测试目标：`BumpListAlloc` 作为拥有型 `Vec` allocator 可用，且 `Vec::clone` 通过
+/// `AllocatorClone` 共享同一 arena。
+/// Test goal: `BumpListAlloc` works as an owned `Vec` allocator, and `Vec::clone` shares
+/// the same arena through `AllocatorClone`.
+/// - 手段 / Method: 用 `Vec<u32, TestBump>` 写入数据并 clone；先 drop 原 Vec，再 drop
+///   clone。
+/// - 判定 / Assertion: 两份数据一致；drop 原 Vec 时第一页仍存活；全部 drop 后 Page
+///   申请与释放次数配平。
+#[test]
+fn owned_allocator_supports_vec_clone() {
+    let (alloc, counters) = CountingAlloc::new();
+    let bump = BumpListAlloc::new_in(alloc, PageSize::P4K).expect("4 KiB 页应当受支持");
+
+    let mut values: Vec<u32, TestBump> = Vec::new_in(bump);
+    values.extend_from_slice(&[1u32, 2u32, 3u32]);
+    let copy = values.clone();
+    assert_eq!(&values[..], &[1u32, 2u32, 3u32]);
+    assert_eq!(&copy[..], &[1u32, 2u32, 3u32]);
+
+    drop(values);
+    assert_eq!(counters.deallocs(), 0, "clone 仍持有 arena");
+    drop(copy);
+    assert_eq!(counters.allocs(), counters.deallocs());
 }
 
 /// 测试目标：默认 allocator 是 `Send + Sync`，`&BumpListAlloc` 也可跨线程共享；

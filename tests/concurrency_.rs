@@ -132,3 +132,37 @@ fn concurrent_partial_release_keeps_pages_alive() {
     drop(bump);
     assert_eq!(counters.allocs(), counters.deallocs());
 }
+
+/// 测试目标：多个线程并发 clone 同一个 arena 并各自使用拥有型 `Vec`，引用计数保证
+/// 最后一个句柄析构前 arena 仍然有效。
+/// Test goal: Multiple threads concurrently clone one arena and use owned `Vec`s; the
+/// reference count keeps the arena alive until the last handle is dropped.
+/// - 手段 / Method: 在 `thread::scope` 中让 4 个线程各自 `BumpListAlloc::clone`，用
+///   `Vec<u64, BumpListAlloc<CountingAlloc>>` 写入 32 个值后结束；主线程保留原句柄。
+/// - 判定 / Assertion: 每个线程读到自己的数据；作用域结束后只保留 root 页；drop 主句柄
+///   后 Page 申请与释放次数配平。
+#[test]
+fn concurrent_clones_keep_arena_alive() {
+    let (alloc, counters) = CountingAlloc::new();
+    let bump = BumpListAlloc::new_in(alloc, PageSize::P4K).expect("4 KiB 页应当受支持");
+
+    thread::scope(|scope| {
+        for thread_id in 0..4u64 {
+            let bump_ref = &bump;
+            scope.spawn(move || {
+                let handle = BumpListAlloc::clone(bump_ref);
+                let mut values: Vec<u64, TestBump> = Vec::new_in(handle);
+                for index in 0..32u64 {
+                    values.push(thread_id * 1000 + index);
+                }
+                assert_eq!(values[0], thread_id * 1000);
+                assert_eq!(values[31], thread_id * 1000 + 31);
+            });
+        }
+    });
+
+    // 线程内的句柄都已析构，主线程的句柄仍让 root 页存活。
+    assert_eq!(counters.allocs() - counters.deallocs(), 1);
+    drop(bump);
+    assert_eq!(counters.allocs(), counters.deallocs());
+}

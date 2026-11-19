@@ -14,7 +14,9 @@
 //!
 //! Page 内以指针宽度 `P = size_of::<usize>()` 为一个 cell。`PageState.base_` 是首个
 //! 可分配 cell 的页内绝对下标（可以大于 `Page::CELLS`，页与页可以不同），`cells_`
-//! 是从 `base_` 起可用的 cell 数。`BlockHeader.order_flags` 的低 15 位是自身 cell
+//! 是从 `base_` 起可用的 cell 数。普通页的 `base_` 是 `Page::CELLS`；第一页在 Page
+//! 头之后还内嵌了 `BumpListCore` 与底层分配器 `A`（见 `init_page_`），因此 `base_`
+//! 更大、容量更小。`BlockHeader.order_flags` 的低 15 位是自身 cell
 //! 的页内绝对下标，最高位表示该块已经释放；`next_free` 是本块末尾（也就是下一块头）
 //! 的 cell 下标。最后一块的 `next_free` 等于 `base_ + used_`，因此扫描时不需要
 //! `first_` / `last_`，直接从 `base_` 沿链走到 `base_ + used_` 即可。
@@ -531,6 +533,20 @@ impl Page {
         state.returned_ == state.used_
     }
 
+    /// 本页从 `base_` 起可用的 cell 数（`PageState.cells_`）。
+    ///
+    /// 第一页的 `base_` 还要容纳 `Page` 之外的 Core 与 `A`，因此它的容量可能小于
+    /// 普通页；分配路径据此判断“空的第一页放不下”是否可能由普通页解决。
+    ///
+    /// # Safety
+    ///
+    /// 调用方必须持有本 Page 的页锁。
+    pub(crate) unsafe fn capacity_locked_(&self) -> CellIndex {
+        // SAFETY: 由调用方保证页锁。
+        let state = unsafe { &*self.state_.get() };
+        state.cells_
+    }
+
     /// 扫描整页块链，返回 `(live, freed)`。
     ///
     /// 从 `base_` 开始，沿每个块头的 `next_free`（本块末尾 / 下一块头）走到
@@ -647,15 +663,15 @@ mod tests_ {
             let ptr = unsafe { alloc(layout) };
             let page_ptr = NonNull::new(ptr).expect("测试页分配成功");
             let mem = NonNull::slice_from_raw_parts(page_ptr, bytes);
-            // 用 Box::into_raw 固定 owner 地址；避免把 Box 移进结构体时对 pointee
-            // 做 Unique retag 而让 Page 里的 owner 指针失效。
+            // 用 Box::into_raw 固定句柄地址；`BumpListAlloc` 本身已经可以移动，这里保留
+            // 这种写法只是为了不把 allocator 放进 TestPage 后参与字段析构顺序。
             let bump_ptr_ = NonNull::new(Box::into_raw(Box::new(
                 crate::BumpListAlloc::new(crate::PageSize::P4K).expect("4 KiB 页应当受支持"),
             )))
             .expect("Box::into_raw 不返回空指针");
-            // SAFETY: bump_ptr_ 指向 Box 里的稳定分配器；Core 自身在另一个 Box 中，
-            // 地址不随外层 BumpListAlloc 移动。
-            let core_ptr_ = unsafe { NonNull::from(&bump_ptr_.as_ref().core_) };
+            // SAFETY: Core 位于 BumpListAlloc 的第一页内存中，地址在 allocator 析构前
+            // 保持稳定；TestPage 的 Drop 会最后才析构这个 Box。
+            let core_ptr_ = unsafe { NonNull::from(bump_ptr_.as_ref().core_()) };
             // SAFETY: 内存足够、按 Page 对齐且独占；owner 在 TestPage 生命周期内稳定。
             let page = unsafe { Page::init_in_place_(mem, core_ptr_, first_cell) };
             Self {

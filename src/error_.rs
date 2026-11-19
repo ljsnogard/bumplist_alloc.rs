@@ -26,6 +26,22 @@ pub enum BumpListAllocError {
         /// 被拒绝的页大小。
         page_size: PageSize,
     },
+
+    /// 页大小本身受平台支持，但第一页扣除 `Page`、`BumpListCore` 与底层分配器 `A`
+    /// 的存储后，剩余空间不足以容纳一个最小分配块（块头 + 一个数据 cell）。
+    ///
+    /// 第一页同时保存分配器元数据，因此它的可用容量比普通页小；典型情况是底层
+    /// 分配器 `A` 自身较大，或选择了该分配器无法承载的小页。
+    PageSizeTooSmallForAllocator {
+        /// 被拒绝的页大小。
+        page_size: PageSize,
+    },
+
+    /// 申请第一页（包含 `Page`、`BumpListCore` 与 `A`）时，底层分配器返回失败。
+    InitPageAllocationFailed {
+        /// 请求的页大小。
+        page_size: PageSize,
+    },
 }
 
 impl fmt::Display for BumpListAllocError {
@@ -34,6 +50,14 @@ impl fmt::Display for BumpListAllocError {
             Self::UnsupportedPageSize { page_size } => write!(
                 f,
                 "页大小 {page_size:?} 在当前平台不受支持（页内 cell 数上限为 {MAX_PAGE_CELLS}）"
+            ),
+            Self::PageSizeTooSmallForAllocator { page_size } => write!(
+                f,
+                "页大小 {page_size:?} 不足以容纳分配器元数据（Page、BumpListCore 与底层分配器）及最小分配块"
+            ),
+            Self::InitPageAllocationFailed { page_size } => write!(
+                f,
+                "底层分配器无法提供 {page_size:?} 的第一页（分配器元数据页）"
             ),
         }
     }
