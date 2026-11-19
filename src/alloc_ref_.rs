@@ -275,7 +275,7 @@ mod tests_ {
     ///
     /// - 手段 / Means: 用 `BumpListAllocRef` 克隆出 `TrAllocSource`，再通过 `TrArena`
     ///   分配一个 `u32` 并立即驱动 future 完成。
-    /// - 判定 / Verdict: 克隆句柄可用；分配回来的 `BumpListBox` deref 后等于原值。
+    /// - 判定 / Verdict: 克隆句柄可用；分配回来的 `Box` deref 后等于原值。
     #[cfg(feature = "denco_arena")]
     #[test]
     fn alloc_ref_denco_traits_forward_() {

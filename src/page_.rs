@@ -211,7 +211,7 @@ impl Page {
     }
 
     /// owner 指针（去掉页锁标记）。
-    fn owner_ptr_(&self) -> NonNull<BumpListCore> {
+    pub(crate) fn owner_ptr_(&self) -> NonNull<BumpListCore> {
         let raw = self
             .owner_
             .load(Ordering::Acquire)

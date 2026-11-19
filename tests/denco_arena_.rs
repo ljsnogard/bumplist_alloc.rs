@@ -64,8 +64,8 @@ fn arena_bytes_copy_() {
     assert_eq!(bytes, b"hello");
 }
 
-/// 测试 `BumpListBox` 在析构时运行 `T` 的析构函数。
-/// Test that `BumpListBox` runs `T`'s destructor when it is dropped.
+/// 测试 `Box` 在析构时运行 `T` 的析构函数。
+/// Test that `Box` runs `T`'s destructor when it is dropped.
 ///
 /// - 手段：在 arena 里分配一个带 `Drop` 计数的值，先检查计数为 0，再显式 `drop` 句柄。
 /// - 判断：drop 前计数为 0，drop 后计数恰好为 1，说明析构函数被执行且只执行一次。

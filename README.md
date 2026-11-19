@@ -112,7 +112,7 @@ cargo test --features std
 - 标准 `core::alloc::Allocator`，但只实现给 `&BumpListAlloc`；
 - `denco_arena`：额外实现 `abs_denco::de::TrArena` / `TrArenaBytes`，让
   `MpDecoder::new_in` 可以把字符串 / 字节切片分配进同一个分配器；`TrArena::Ref<T>` 是
-  `BumpListBox`，析构时运行 `T` 的析构函数并调用 `Page::release_` 把块归还到页内；
+  `Box`，析构时运行 `T` 的析构函数并调用 `Page::release_` 把块归还到页内；
 - 不实现 `Clone`；需要共享时使用 `&` 或 `Arc`；
 - 默认 `A = Global`；`A: Send + Sync` 时 `BumpListAlloc` 是 `Send + Sync`；
 - 所有 Page 同大小；最多缓存一个空 tail Page，其余空页归还；

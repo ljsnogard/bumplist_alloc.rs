@@ -247,7 +247,7 @@ impl BumpListCore {
     }
 
     /// 分配主路径。
-    fn allocate_(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+    pub(crate) fn allocate_(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         if layout.size() == 0 {
             return Self::zero_sized_(layout.align());
         }
@@ -594,8 +594,8 @@ mod tests_ {
     use crate::page_::Page;
     use std::vec::Vec;
 
-    /// 测试 `TrArena` 的 `BumpListBox` 析构后把块归还给页。
-    /// Test that dropping a `TrArena` `BumpListBox` releases its block back to the page.
+    /// 测试 `TrArena` 的 `Box` 析构后把块归还给页。
+    /// Test that dropping a `TrArena` `Box` releases its block back to the page.
     ///
     /// - 手段：用 `TrArena::alloc_value_async` 分配一个 `u64`，检查 live 为 1；drop 句柄后再检查。
     /// - 判定：drop 后 live 回到 0，且唯一空页仍被保留为 tail（页数为 1）。

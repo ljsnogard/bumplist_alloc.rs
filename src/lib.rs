@@ -46,7 +46,7 @@
 //! 析构时会扫描页内块链，并在发现未释放块时把警告写到 stderr；默认构建不输出警告，
 //! 但仍然会通过块链检查页状态。
 
-#![feature(allocator_ext)]
+#![feature(allocator_ext, coerce_unsized, unsize)]
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
