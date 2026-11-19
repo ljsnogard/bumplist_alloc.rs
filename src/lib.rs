@@ -2,10 +2,11 @@
 //!
 //! 设计目标：
 //!
-//! - 标准 [`core::alloc::Allocator`]：对 `&BumpListAlloc` 直接实现；`Arc` / `Rc` /
-//!   `Box` 等稳定 `Deref` 句柄通过 [`BumpListAllocRef`] 适配。每块分配仍带有借用
-//!   生命周期；
-//! - `A: Send` 时 `Send + Sync`（不要求 `A: Sync`），但不实现 `Clone`；
+//! - 标准 [`core::alloc::Allocator`]：`BumpListAlloc` 与 `&BumpListAlloc` 都可用；
+//!   `Arc` / `Rc` / `Box` 等稳定 `Deref` 句柄通过 [`BumpListAllocRef`] 适配。按借用
+//!   使用时的块带有借用生命周期；
+//! - `Clone` 只增加共享第一页 Core 的引用计数，不复制 Page 或底层分配器；最后一个
+//!   句柄析构时才归还所有 Page。`A: Send` 时 `Send + Sync`（不要求 `A: Sync`）；
 //! - 每个实例的所有 Page 大小相同，页大小从有限的 [`PageSize`] 选项中选取；
 //! - Page 之间用指针串成双向链表，Page 头与块头都内嵌在 Page 内存中；
 //! - 每个 Page 有独立的页锁，普通归还只需要页锁；只有空页摘链才需要 allocator 的
@@ -39,7 +40,7 @@
 //! 里地址稳定的 Core，不依赖句柄自身的地址。
 //!
 //! `BumpListCore` 保存一个指向 `A` 的 `NonNull<dyn Allocator>`，所有对 `A` 的
-//! allocate / deallocate 都通过它转发，并由 `backing_lock_` 串行化。第一页在构造时
+//! allocate / deallocate 都通过它转发，并由 backing lock 串行化。第一页在构造时
 //! 申请；析构时先把 `A` 移出第一页，再用移出的 `A` 归还第一页本身。
 //!
 //! # `no_std` 与 `std` 特性
@@ -65,9 +66,9 @@ mod boxed_;
 mod denco_arena_;
 mod error_;
 mod init_page_;
-mod lock_;
 mod page_;
 mod page_size_;
+mod state_;
 
 pub use alloc_::BumpListAlloc;
 pub use alloc_ref_::BumpListAllocRef;

@@ -1,10 +1,11 @@
 //! 把「稳定 `Deref<Target = BumpListAlloc>` 的句柄」适配成 [`Allocator`]。
 //!
-//! [`BumpListAlloc`] 本身现在只是一个指向堆上第一页的指针，可以安全移动；它仍然只为
-//! `&BumpListAlloc` 实现 [`Allocator`]，因为分配块的生命周期应由借用期携带，而不是由
-//! allocator 的所有权携带。`Arc<BumpListAlloc, _>` / `Rc<...>` / `Box<...>` 拥有稳定
-//! 的目标地址，却不能直接实现 [`Allocator`]：`Allocator` 是 core 的 trait，而 `Arc` /
-//! `Rc` / `Box` 都不是本 crate 的本地类型，孤儿规则不允许为它们写 impl。
+//! [`BumpListAlloc`] 本身现在只是一个指向堆上第一页的指针，可以安全移动，并且同时为
+//! 按值句柄与共享引用实现 [`Allocator`]（`&BumpListAlloc` 由 core 的 `&A` 通用 impl
+//! 覆盖）。`Arc<BumpListAlloc, _>` / `Rc<...>` / `Box<...>` 拥有稳定的目标地址，却不能
+//! 直接实现本 crate 需要的 `AllocatorClone` / denco arena trait 转发：`AllocatorClone`
+//! 是 core 的 trait，而 `Arc` / `Rc` / `Box` 都不是本 crate 的本地类型，孤儿规则不允许
+//! 为它们写 impl。
 //!
 //! [`BumpListAllocRef`] 是本地 newtype：它只转发 [`Allocator`] / [`AllocatorClone`]，
 //! 在 `denco_arena` 特性下再转发 `TrArena` / `TrArenaBytes` / `TrAllocSource`。
@@ -12,11 +13,12 @@
 //!
 //! # `alloc_ref_`: a local adapter for stable `Deref` handles
 //!
-//! `BumpListAlloc` is now a movable pointer to its heap-allocated first page, but
-//! `Allocator` is still implemented for `&BumpListAlloc` so each block carries a borrow.
-//! `Arc` / `Rc` / `Box` own a stable target but are foreign types, so the orphan rule
-//! forbids implementing `Allocator` for them directly. `BumpListAllocRef` is the local
-//! newtype that forwards the allocator (and denco arena) traits.
+//! `BumpListAlloc` is now a movable pointer to its heap-allocated first page and
+//! implements `Allocator` for both the owned handle and `&BumpListAlloc` (the latter via
+//! core's blanket `&A` impl). `Arc` / `Rc` / `Box` own a stable target but are foreign
+//! types, so the orphan rule forbids implementing `AllocatorClone` / the denco arena
+//! forwarding traits for them directly. `BumpListAllocRef` is the local newtype that
+//! forwards those traits.
 
 use alloc::alloc::Global;
 use core::{

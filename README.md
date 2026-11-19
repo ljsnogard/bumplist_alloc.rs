@@ -1,12 +1,14 @@
 # bumplist-alloc
 
 以**固定大小 Page 链表**组织的 bump 分配器，实现标准
-[`core::alloc::Allocator`](https://doc.rust-lang.org/core/alloc/trait.Allocator.html)，
-但只对 `&BumpListAlloc` 实现，因此每块分配都带有借用生命周期。
+[`core::alloc::Allocator`](https://doc.rust-lang.org/core/alloc/trait.Allocator.html)。
+`BumpListAlloc` 自身和 `&BumpListAlloc` 都可以作为 allocator：按值使用时容器拥有
+arena 句柄，按借用使用时每块分配带有借用生命周期。
 
-设计目标是“不带 `Retain<T>` 的 sw-scope”：适合小对象 arena，不实现 `Clone`；
-底层分配器 `A: Send` 时 `BumpListAlloc` 是 `Send + Sync`（对 `A` 的访问由内部锁串行化，
-不要求 `A: Sync`），空 Page 可以归还给底层分配器。
+设计目标是“不带 `Retain<T>` 的 sw-scope”：适合小对象 arena。`BumpListAlloc` 的
+`Clone` 只增加第一页 Core 中的引用计数，不复制 Page 或底层分配器；最后一个句柄析构时
+才归还所有页。底层分配器 `A: Send` 时 `BumpListAlloc` 是 `Send + Sync`（对 `A` 的访问
+由 backing lock 串行化，不要求 `A: Sync`），空 Page 可以归还给底层分配器。
 
 `BumpListAlloc<A>` 本身只是一个指向堆上第一页的指针（与 `usize` 同宽），因此可以安全
 移动；第一页里同时保存 `Page` 头、非泛型 `BumpListCore` 与底层分配器 `A`。
@@ -31,6 +33,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 `Vec` 的分配器类型是 `&BumpListAlloc`，因此 `values` 存活期间 `bump` 不能被移动或
 析构；这仍然来自“每块分配带借用生命周期”，而不是 `BumpListAlloc` 自身的地址限制。
 只要没有未结束的借用，`BumpListAlloc` 可以自由移动、放进结构体或返回。
+
+也可以让容器拥有 arena 句柄；`Vec::clone` 会克隆句柄（引用计数 +1）并在同一个 arena
+里分配新缓冲区：
+
+```rust
+use bumplist_alloc::{BumpListAlloc, PageSize};
+use std::vec::Vec;
+
+let bump = BumpListAlloc::new(PageSize::P4K)?;
+let mut values: Vec<u32, BumpListAlloc> = Vec::new_in(bump);
+values.extend_from_slice(&[1, 2, 3, 4]);
+let copy = values.clone();
+assert_eq!(&copy[..], &[1, 2, 3, 4]);
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
 
 ## 固定页大小
 
@@ -73,7 +90,7 @@ BumpListAlloc<A>                 // 只有一个指针（#[repr(transparent)]）
     │   ├── page_size_
     │   ├── root_page_           // 第一页；永不归还
     │   ├── backing_: NonNull<dyn Allocator>  // 指向下面的 A
-    │   ├── list_lock_ / backing_lock_
+    │   ├── state_: AtomicUsize  // 低位引用计数；最高两位是 list/backing lock
     │   └── inner_: PageList
     │       ├── head_ ──> Page A <──> Page B <──> Page C
     │       └── tail_                     // 分配时优先尝试的页
@@ -90,14 +107,14 @@ BumpListAlloc<A>                 // 只有一个指针（#[repr(transparent)]）
 `BumpListCore` 不再保存 `page_cells_` / `page_bytes_`（由 `page_size_` 直接计算），
 也不再有“整分配器自指针”和两个单态化函数指针。底层分配器访问统一通过
 `backing_: NonNull<dyn Allocator>`，它占两个指针宽度，与原来的两个函数指针相同；
-`backing_lock_` 串行化所有对 `A` 的 allocate / deallocate 调用。
+backing lock 串行化所有对 `A` 的 allocate / deallocate 调用。`CoreState` 的
+`AtomicUsize` 同时保存句柄引用计数与两把锁的标记，`Clone` / Drop 只修改低位计数。
 
 每个 Page 有：
 
 - 页首的 Page 头：链表指针、`base_` / `cells_` / `used_` / `returned_` 与 owner
-  指针（最低位兼作页锁）；`Page` / `PageLinks` / `PageState` / `BlockHeader` /
-  `SpinLock` 都是 `#[repr(C)]`，字段按大小手动编排；Page 头在 64 位下 32 字节、
-  32 位下 20 字节；
+  指针（最低位兼作页锁）；`Page` / `PageLinks` / `PageState` / `BlockHeader` 都是
+  `#[repr(C)]`，字段按大小手动编排；Page 头在 64 位下 32 字节、32 位下 20 字节；
 - `PageState` 的 4 个 `u16`：`base_` 是首个可分配 cell 的页内绝对下标，`cells_` 是
   从 `base_` 起可分配的 cell 数，`used_` 是相对 `base_` 的 bump 偏移，`returned_`
   是相对 `base_` 的已归还 cell 数；普通页的 `base_` 是 `Page::CELLS`，第一页的
@@ -137,14 +154,14 @@ cargo test --features std
 
 ## 特性
 
-- 标准 `core::alloc::Allocator`，但只实现给 `&BumpListAlloc`；`BumpListAlloc` 本身是
-  单指针、可移动的句柄；
+- 标准 `core::alloc::Allocator`：`BumpListAlloc` 与 `&BumpListAlloc` 都可用；句柄是
+  单指针、可移动的，并实现引用计数式 `Clone` 与 `AllocatorClone`；
 - `denco_arena`：额外实现 `abs_denco::de::TrArena` / `TrArenaBytes`，让
   `MpDecoder::new_in` 可以把字符串 / 字节切片分配进同一个分配器；`TrArena::Ref<T>` 是
   `Box`，析构时运行 `T` 的析构函数并调用 `Page::release_page_` 把块归还到页内；
-- 不实现 `Clone`；需要共享时使用 `&` 或 `Arc`；
+- `Clone` 只增加第一页 Core 里的引用计数，不复制 arena；`Arc` / `Rc` 仍可用于外部共享；
 - 默认 `A = Global`；`A: Send` 时 `BumpListAlloc` 是 `Send + Sync`（`A` 的访问由
-  `backing_lock_` 串行化，不要求 `A: Sync`）；
+  backing lock 串行化，不要求 `A: Sync`）；
 - 所有 Page 同大小；第一页永久保留，此外最多保留一个空 Page，其余空页归还；
 - 构造时立即申请第一页，因此 `new` / `new_in` 可能因页大小或底层分配失败而返回错误；
 - `no_std`，无外部依赖；锁为自旋锁。

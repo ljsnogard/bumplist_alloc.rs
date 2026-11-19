@@ -14,12 +14,12 @@ use core::{
 use crate::{
     error_::BumpListAllocError,
     init_page_::InitPage,
-    lock_::{SpinGuard, SpinLock},
     page_::{CellIndex, PTR, Page},
     page_size_::PageSize,
+    state_::{CoreLockGuard, CoreState},
 };
 
-/// Page 链表的头尾；由 `BumpListAlloc::list_lock_` 保护。
+/// Page 链表的头尾；由 Core 的 list lock 保护。
 struct PageList {
     head_: Option<NonNull<Page>>,
     tail_: Option<NonNull<Page>>,
@@ -34,15 +34,16 @@ impl PageList {
     }
 }
 
-/// 与 `A` 无关的分配器核心：页大小、链表锁、页链表与页 backing。
+/// 与 `A` 无关的分配器核心：页大小、共享状态、页链表与页 backing。
 ///
 /// Core 位于第一页内存中的 [`InitPage<A>`] 里，Page 的 owner 指向它。它与底层分配器
 /// `A` 的相对位置在构造后固定：backing 字段保存一个指向 `A` 的 `NonNull<dyn Allocator>`
 /// （fat 指针，所占空间与原来的两个函数指针相同），不再需要“整分配器自指针”和
 /// `offset_of!`，也不需要单态化函数指针。
 ///
-/// `A: Send` 只保证 A 可以独占地在任意线程使用；`backing_lock_` 串行化所有对 A 的
-/// allocate / deallocate 调用，因此 A 不需要 `Sync`。
+/// [`CoreState`] 用一个 `AtomicUsize` 同时保存句柄引用计数与两把锁的标记：最高位是
+/// list lock，次高位是 backing lock。`A: Send` 只保证 A 可以独占地在任意线程使用；
+/// backing lock 串行化所有对 A 的 allocate / deallocate 调用，因此 A 不需要 `Sync`。
 #[repr(C)]
 pub(crate) struct BumpListCore {
     /// 第一页的 Page 首地址；它始终留在链表中，永远不会被归还。
@@ -51,11 +52,8 @@ pub(crate) struct BumpListCore {
     /// 被移出而失效。
     backing_: NonNull<dyn Allocator>,
     inner_: UnsafeCell<PageList>,
-    list_lock_: SpinLock,
-    /// 串行化对底层分配器 `A` 的所有 allocate / deallocate 调用。
-    ///
-    /// `A: Send` 只保证 A 可以独占地在任意线程使用；并发调用仍需要本锁。
-    backing_lock_: SpinLock,
+    /// 低位引用计数；最高两位分别是 list / backing lock 标记。
+    state_: CoreState,
     page_size_: PageSize,
 }
 
@@ -73,8 +71,7 @@ impl BumpListCore {
             root_page_: root_page,
             backing_: backing,
             inner_: UnsafeCell::new(PageList::with_root_(root_page)),
-            list_lock_: SpinLock::new(),
-            backing_lock_: SpinLock::new(),
+            state_: CoreState::new(),
             page_size_: page_size,
         }
     }
@@ -84,8 +81,22 @@ impl BumpListCore {
         self.page_size_
     }
 
-    fn lock_list_(&self) -> SpinGuard<'_> {
-        self.list_lock_.lock_()
+    fn lock_list_(&self) -> CoreLockGuard<'_> {
+        self.state_.lock_list_()
+    }
+
+    fn lock_backing_(&self) -> CoreLockGuard<'_> {
+        self.state_.lock_backing_()
+    }
+
+    /// 增加一个 `BumpListAlloc` 句柄引用。
+    pub(crate) fn clone_ref_(&self) {
+        self.state_.clone_ref_()
+    }
+
+    /// 减少一个句柄引用；返回是否已经是最后一个句柄。
+    pub(crate) fn release_ref_(&self) -> bool {
+        self.state_.release_ref_()
     }
 
     /// 申请一个普通 Page 并初始化 Page 头；不挂链。
@@ -97,9 +108,9 @@ impl BumpListCore {
         let layout =
             Layout::from_size_align(page_bytes, mem::align_of::<Page>()).map_err(|_| AllocError)?;
         // SAFETY: backing 在第一页构造后一直指向仍然存活、位于第一页内的 A；
-        // `backing_lock_` 串行化所有对 A 的调用，因此 A 只需要 `Send`。
+        // backing lock 串行化所有对 A 的调用，因此 A 只需要 `Send`。
         let mem = {
-            let _guard = self.backing_lock_.lock_();
+            let _guard = self.lock_backing_();
             unsafe { self.backing_.as_ref() }.allocate(layout)
         }?;
         let page_mem = NonNull::slice_from_raw_parts(mem.cast::<u8>(), page_bytes);
@@ -126,9 +137,9 @@ impl BumpListCore {
             Layout::from_size_align_unchecked(self.page_size_.bytes(), mem::align_of::<Page>())
         };
         // SAFETY: page/layout 来自本分配器，A 先于 Core 存续；
-        // `backing_lock_` 串行化所有对 A 的调用，因此 A 只需要 `Send`。
+        // backing lock 串行化所有对 A 的调用，因此 A 只需要 `Send`。
         {
-            let _guard = self.backing_lock_.lock_();
+            let _guard = self.lock_backing_();
             let backing = unsafe { self.backing_.as_ref() };
             // SAFETY: 由调用方保证 page/layout 契约。
             unsafe { backing.deallocate(page.cast::<u8>(), layout) };
@@ -500,9 +511,13 @@ impl BumpListCore {
 
 /// 以固定大小 Page 链表组织的 bump 分配器。
 ///
-/// # 生命周期
+/// # 生命周期与 Clone
 ///
-/// 只为 `&BumpListAlloc` 实现 [`Allocator`]，因此交给容器的分配器类型携带借期：
+/// [`Allocator`] 同时为 `BumpListAlloc` 与 `&BumpListAlloc` 实现：
+///
+/// - 按值使用（如 `Vec<u32, BumpListAlloc>`）时，容器拥有一个句柄，块的生命周期与
+///   容器 / arena 句柄一致；
+/// - 按借用使用（如 `Vec<u32, &BumpListAlloc>`）时，分配块携带借期。
 ///
 /// ```
 /// use bumplist_alloc::{BumpListAlloc, PageSize};
@@ -515,14 +530,16 @@ impl BumpListCore {
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 ///
-/// `BumpListAlloc` 本身不实现 `Clone`；需要共享时使用 `&` 或 `Arc`。
+/// `BumpListAlloc::clone` 只增加第一页 Core 里的引用计数，不复制 Page，也不复制底层
+/// 分配器 `A`；所有 clone 共享同一个 arena。最后一个句柄析构时才归还所有 Page 与
+/// 第一页内存。需要 `Arc` / `Rc` 等外部共享句柄时仍可使用 [`BumpListAllocRef`](crate::BumpListAllocRef)。
 ///
 /// # 线程安全
 ///
 /// 类型参数要求 `A: Send`。所有对底层分配器 `A` 的调用（页申请 / 页归还）都由
-/// `BumpListCore` 的 `backing_lock_` 串行化，因此 `BumpListAlloc<A>` 是
-/// `Send + Sync`，不要求 `A: Sync`。`A: !Send` 的分配器不能用于本类型；例如需要
-/// trait object 时，应使用 `&(dyn Allocator + Sync)` 而不是 `&dyn Allocator`。
+/// Core 的 backing lock 串行化，因此 `BumpListAlloc<A>` 是 `Send + Sync`，不要求
+/// `A: Sync`。`A: !Send` 的分配器不能用于本类型；例如需要 trait object 时，应使用
+/// `&(dyn Allocator + Sync)` 而不是 `&dyn Allocator`。
 ///
 /// # 单指针句柄与可移动性
 ///
@@ -542,21 +559,41 @@ pub struct BumpListAlloc<A: Allocator + Send = Global> {
     _owns_a_: PhantomData<A>,
 }
 
-// SAFETY: `PageList` 与 Page 链表中的 `NonNull` 指针由 `list_lock_` 保护；Page 的
+// SAFETY: `PageList` 与 Page 链表中的 `NonNull` 指针由 list lock 保护；Page 的
 // `state_` 由页锁保护；第一页在构造后地址稳定，移动句柄只移动指针。`A` 的 `Send`
 // 允许整个 allocator（包括最终从第一页移出的 A）转移线程。
 unsafe impl<A: Allocator + Send> Send for BumpListAlloc<A> {}
 
-// SAFETY: 共享 `&BumpListAlloc` 时，链表由链表锁保护，页状态由页锁保护；
-// 所有对底层分配器 `A` 的调用都由 `backing_lock_` 串行化，`A: Send` 足以让
-// 这把锁把 A 的独占访问安全地借给任意线程。Page 的 `links_` / `state_` 使用
-// `UnsafeCell`，分别由两把锁保护不相交字段；第一页在句柄共享期间不会移动。
+// SAFETY: 共享 `&BumpListAlloc` 时，链表由 list lock 保护，页状态由页锁保护；
+// 所有对底层分配器 `A` 的调用都由 backing lock 串行化，`A: Send` 足以让这把锁把
+// A 的独占访问安全地借给任意线程。Page 的 `links_` / `state_` 使用 `UnsafeCell`，
+// 分别由两把锁保护不相交字段；第一页在句柄共享期间不会移动。
 unsafe impl<A: Allocator + Send> Sync for BumpListAlloc<A> {}
+
+impl<A: Allocator + Send> Clone for BumpListAlloc<A> {
+    /// 克隆句柄：增加第一页 Core 中的引用计数，不申请 Page，不复制 `A`。
+    ///
+    /// # Panics
+    ///
+    /// 引用计数达到可表示上限时 panic；该上限为低位掩码（64 位平台 `2^62 - 1`），
+    /// 实际使用中不可达。
+    fn clone(&self) -> Self {
+        self.core_().clone_ref_();
+        Self {
+            page_: self.page_,
+            _owns_a_: PhantomData,
+        }
+    }
+}
 
 impl<A: Allocator + Send> Drop for BumpListAlloc<A> {
     fn drop(&mut self) {
-        // SAFETY: `self` 独占第一页；`page_` 来自 `new_in` 且尚未被归还。
-        unsafe { InitPage::drop_in_place_(self.page_) };
+        let last = self.core_().release_ref_();
+        if last {
+            // SAFETY: 引用计数减到 0，说明没有其它句柄、引用或正在进行的 Core 操作；
+            // `page_` 来自 `new_in` 且尚未被归还。
+            unsafe { InitPage::drop_in_place_(self.page_) };
+        }
     }
 }
 
@@ -642,7 +679,7 @@ impl BumpListAlloc<Global> {
     }
 }
 
-unsafe impl<A: Allocator + Send> Allocator for &BumpListAlloc<A> {
+unsafe impl<A: Allocator + Send> Allocator for BumpListAlloc<A> {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         self.core_().allocate_(layout)
     }
@@ -653,7 +690,9 @@ unsafe impl<A: Allocator + Send> Allocator for &BumpListAlloc<A> {
     }
 }
 
-unsafe impl<A: Allocator + Send> AllocatorClone for &BumpListAlloc<A> {}
+// SAFETY: `Clone` 只增加共享 Core 的引用计数；clone 与原来的句柄指向同一个 arena，
+// 因此任意 clone 都能释放另一 clone 分配的块。
+unsafe impl<A: Allocator + Send> AllocatorClone for BumpListAlloc<A> {}
 
 #[cfg(test)]
 mod tests_ {
@@ -1001,6 +1040,35 @@ mod tests_ {
                 page_size: PageSize::P1K
             })
         ));
+    }
+
+    /// 测试目标：拥有型 `BumpListAlloc` 可以直接使用方法语法调用 `Allocator`。
+    /// Test goal: An owned `BumpListAlloc` can call `Allocator` methods with method
+    /// syntax.
+    /// - 手段 / Method: `bump.allocate(layout)` 分配一个 `u8`，再用
+    ///   `bump.deallocate(...)` 归还。
+    /// - 判定 / Assertion: 两次调用都成功，说明方法解析没有因 `&BumpListAlloc` 的
+    ///   通用 impl 产生歧义。
+    #[test]
+    fn owned_allocator_method_syntax() {
+        let bump = BumpListAlloc::new(PageSize::P4K).expect("4 KiB 页");
+        let layout = Layout::new::<u8>();
+        let block = bump.allocate(layout).expect("分配成功");
+        // SAFETY: 指针来自同一 allocator 与 layout。
+        unsafe { bump.deallocate(block.cast(), layout) };
+    }
+
+    /// 测试目标：`BumpListAlloc` 与 `&BumpListAlloc` 都实现 `Clone` 与
+    /// `AllocatorClone`。
+    /// Test goal: Both `BumpListAlloc` and `&BumpListAlloc` implement `Clone` and
+    /// `AllocatorClone`.
+    /// - 手段 / Method: 编译期 trait 断言。
+    /// - 判定 / Assertion: 断言通过。
+    #[test]
+    fn allocator_is_clone_and_allocator_clone() {
+        fn assert_allocator_clone<T: Allocator + AllocatorClone + Clone>() {}
+        assert_allocator_clone::<BumpListAlloc<Global>>();
+        assert_allocator_clone::<&BumpListAlloc<Global>>();
     }
 
     /// 测试目标：`BumpListAlloc` 及其共享引用满足 `Send + Sync`。

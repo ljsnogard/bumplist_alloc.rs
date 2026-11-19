@@ -36,7 +36,7 @@ use crate::page_::{CellIndex, Page};
 /// - `T: Clone`（`T: Sized`）时通过原 arena 的 `Page` owner 重新分配一份（零尺寸 `T`
 ///   复用对齐悬垂地址）；
 /// - `T: Send` / `T: Sync` 时 `Box` 分别是 `Send` / `Sync`。arena 的底层分配器要求
-///   `A: Send`，而 `BumpListCore` 的 `backing_lock_` 串行化所有对 `A` 的调用，因此
+///   `A: Send`，而 Core 的 backing lock 串行化所有对 `A` 的调用，因此
 ///   不需要 `A: Sync`。
 ///
 /// # 限制
@@ -349,13 +349,13 @@ impl<T: ?Sized> TrUnique for Box<'_, T> {}
 impl<T: ?Sized> Unpin for Box<'_, T> {}
 
 // SAFETY: `Box` 独占一个 `T`，跨线程转移时 `T: Send` 允许在新线程使用/析构它。
-// 它所属的 `BumpListAlloc<A>` 在类型上要求 `A: Send`，且 Core 用 `backing_lock_`
+// 它所属的 `BumpListAlloc<A>` 在类型上要求 `A: Send`，且 Core 用 backing lock
 // 串行化对 `A` 的访问；`'a` 保证 arena 在句柄存活期间有效，因此跨线程的块归还
 // （以及 Clone 中的页申请）是安全的。
 unsafe impl<T: ?Sized + Send> Send for Box<'_, T> {}
 
 // SAFETY: 共享 `&Box` 只会交出 `&T`，因此要求 `T: Sync`；`Clone` 会在同一 arena 里
-// 申请新块，其 `A` 访问同样由 `backing_lock_` 串行化。
+// 申请新块，其 `A` 访问同样由 backing lock 串行化。
 unsafe impl<T: ?Sized + Sync> Sync for Box<'_, T> {}
 
 impl<T: ?Sized> AsRef<T> for Box<'_, T> {
